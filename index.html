@@ -1,0 +1,1350 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { AlertCircle, Calendar, Users, Briefcase, BarChart3, Table, ArrowRight, Save, Upload, FileSpreadsheet, CheckCircle2, AlertTriangle, FileInput, X, Info, Search, Eye, Sparkles, Loader2, Download } from 'lucide-react';
+import {  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer } from 'recharts';
+
+// --- Gemini API Key ---
+const apiKey = ""; // 実行環境により自動注入されます
+
+// --- 1. 定数・設定定義 ---
+
+// 作業名とスキル列名の対応マップ (左:需要データの作業名, 右:能力表の列名)
+const TASK_SKILL_MAP = {
+  '除草剤散布（ブーム）': '除草剤ブーム',
+  '除草剤散布（手ざお）': '除草剤手ざお',
+  '草刈（定植後）': '草刈定植後',
+  '草刈（定植前）': '草刈定植前',
+  '潅水（ブーム）': '潅水ブーム',
+  '追肥': '追肥（次作用）',
+  '追肥（次作用）': '追肥（次作用）',
+  '畝立て': '畝立て',
+  '中耕': '中耕',
+  '耕耘': '耕耘',
+  '施肥': '施肥',
+  'マルチ張り': 'マルチ張り',
+  '定植': '定植',
+  '収穫': '収穫',
+  '防除': '防除',
+  'マルチ掃除': 'マルチ掃除',
+  'マルチ剥ぎ': 'マルチ剥ぎ',
+  '荒起こし': '荒起こし',
+  '草取り': '草取り'
+};
+
+const TASK_PRIORITIES = {
+  '収穫': 10,
+  '定植': 20,
+  'マルチ張り': 30, '畝立て': 30, '耕耘': 30, '施肥': 30, '中耕': 30,
+  '防除': 40, '潅水（ブーム）': 40, '追肥': 40, '追肥（次作用）': 40,
+  '除草剤散布（ブーム）': 40, '除草剤散布（手ざお）': 40,
+  '草刈（定植前）': 40, '草刈（定植後）': 40, '草取り': 40,
+  'マルチ剥ぎ': 50, '荒起こし': 50, 'マルチ掃除': 50
+};
+
+const DEFAULT_PRIORITY = 99;
+
+// --- 2. ヘルパー関数 ---
+
+// 名前の正規化（スペース除去・英数半角化）
+const normalizeName = (name) => {
+    if (!name) return "";
+    return String(name)
+        .replace(/[\s　]+/g, "") // 空白除去
+        .trim();
+};
+
+// ヘッダー行を探す（キーワードを含む行をヘッダーとみなす）
+const findHeaderRowIndex = (lines, keywords) => {
+    // 最大30行まで探索
+    for (let i = 0; i < Math.min(lines.length, 30); i++) { 
+        const line = lines[i];
+        // キーワードのいずれかを含むかチェック
+        if (keywords.some(k => line.includes(k))) {
+            return i;
+        }
+    }
+    return 0; // 見つからなければ1行目
+};
+
+// 柔軟な値取得（エイリアス対応）
+const getValue = (row, keys) => {
+    if (!row) return undefined;
+    for (const key of keys) {
+        if (row[key] !== undefined && row[key] !== "") {
+            return row[key];
+        }
+    }
+    return undefined;
+};
+
+// 行列の転置（マトリックス読み込み用）
+const transpose = (matrix) => {
+    if (!matrix || matrix.length === 0) return [];
+    return matrix[0].map((_, colIndex) => matrix.map(row => row[colIndex]));
+};
+
+// TSV解析 (スマート解析版 v2)
+// Matrix形式の場合は rawRows も返す
+const parseTSV = (text, type) => {
+  const lines = text.trim().split('\n');
+  if (lines.length === 0) return { data: [], headers: [], headerRowIndex: 0, rawLines: [] };
+
+  // rawLines: 各行を配列に分割したもの（マトリックス解析用）
+  const rawLines = lines.map(line => line.split('\t').map(c => c.trim()));
+
+  // タイプに応じた必須キーワードでヘッダー行を特定
+  let keywords = [];
+  if (type === 'demand') keywords = ['作業', '計画', '需要', '日付']; 
+  else if (type === 'supply') keywords = ['氏名', '名前', '区分', '実働'];
+  else if (type === 'skills') keywords = ['作業員名', '氏名', '名前', 'スキル', 'No'];
+  else keywords = ['日付'];
+
+  const headerRowIndex = findHeaderRowIndex(lines, keywords);
+  
+  // ヘッダー行が存在しない、または特定できない場合でも、とりあえずパースを試みる
+  if (lines[headerRowIndex]) {
+      const headers = lines[headerRowIndex].split('\t').map(h => h.trim());
+      const data = [];
+      
+      for (let i = headerRowIndex + 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue; // 空行スキップ
+
+        const values = lines[i].split('\t');
+        const obj = {};
+        let hasValue = false;
+        headers.forEach((header, index) => {
+          if (header) {
+            let val = values[index] ? values[index].trim() : '';
+            obj[header] = val;
+            if(val) hasValue = true;
+          }
+        });
+        if (hasValue) data.push(obj);
+      }
+      return { data, headers, headerRowIndex, rawLines };
+  }
+
+  return { data: [], headers: [], headerRowIndex: 0, rawLines };
+};
+
+// --- スキルデータ解析専用関数 (リスト形式/マトリックス形式 両対応) ---
+const parseSkillData = (text) => {
+    const { data, rawLines } = parseTSV(text, 'skills');
+
+    // マトリックス形式判定
+    // 条件: 1列目に「区分」「供給順位」などのキーワードが含まれている
+    const firstCol = rawLines.map(row => row[0]);
+    const hasKubun = firstCol.includes('区分');
+    const hasRank = firstCol.some(val => val && val.includes('順位')); // 供給順位
+    const workerNameRowIndex = rawLines.findIndex(row => row[0] && row[0].includes('作業員名'));
+
+    if (hasKubun && workerNameRowIndex !== -1) {
+        // --- マトリックス形式の処理 ---
+        const workerNames = rawLines[workerNameRowIndex]; // ヘッダー行 (0番目は'作業員名'なので1番目からが名前)
+        
+        const kubunRow = rawLines.find(row => row[0] === '区分') || [];
+        const rankRow = rawLines.find(row => row[0] && row[0].includes('順位')) || [];
+        
+        // スキル行を特定 (行の1列目がTASK_SKILL_MAPのキーまたは値に含まれる、かつ 値が0/1/空)
+        // 簡易的に、「区分」「順位」「人工」「時間区分」「作業員名」「作業名」以外の行をスキルとみなす
+        const excludeKeys = ['区分', '供給順位', '順位', '人工', '時間区分', '作業員名', '作業名', 'No'];
+        const skillRows = rawLines.filter(row => {
+            const key = row[0];
+            return key && !excludeKeys.some(k => key.includes(k));
+        });
+
+        const workers = [];
+        // 列ごとにループ (作業員ごとに処理)
+        for (let col = 1; col < workerNames.length; col++) {
+            const name = workerNames[col];
+            if (!name) continue;
+
+            const category = kubunRow[col] || '';
+            let rank = parseInt(rankRow[col]);
+            if (isNaN(rank)) rank = 999;
+
+            const pSkills = {};
+            skillRows.forEach(sRow => {
+                const skillName = sRow[0];
+                const val = sRow[col];
+                if (['1', '◯', '○', 'O', 'o', 'TRUE'].includes(val)) {
+                    pSkills[skillName] = 1;
+                }
+            });
+
+            workers.push({
+                name: name,
+                category: category,
+                rank: rank,
+                skills: pSkills
+            });
+        }
+        return workers;
+
+    } else {
+        // --- リスト形式 (従来) の処理 ---
+        const workers = [];
+        data.forEach(row => {
+            const name = getValue(row, ['作業員名', '氏名', '名前']);
+            if (!name) return;
+
+            const pSkills = {};
+            Object.keys(row).forEach(key => {
+                const val = row[key];
+                if (['◯', '○', 'O', 'o', '1', 'TRUE', 'true'].includes(String(val))) {
+                    pSkills[key] = 1;
+                }
+            });
+
+            const rankVal = getValue(row, ['供給順位', '優先順位', 'Rank']);
+            let rank = parseInt(rankVal);
+            if (isNaN(rank)) rank = 999;
+
+            const catVal = getValue(row, ['区分', '属性']);
+
+            workers.push({
+                name: name,
+                rank: rank,
+                category: catVal,
+                skills: pSkills
+            });
+        });
+        return workers;
+    }
+};
+
+
+// 日付フォーマット YYYY-MM-DD
+const formatDate = (date) => {
+  const d = new Date(date);
+  if (isNaN(d.getTime())) return '';
+  const month = '' + (d.getMonth() + 1);
+  const day = '' + d.getDate();
+  const year = d.getFullYear();
+  return [year, month.padStart(2, '0'), day.padStart(2, '0')].join('-');
+};
+
+// 週番号取得
+const getWeekNumber = (d) => {
+  d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay()||7));
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+  return Math.ceil(( ( (d.getTime() - yearStart.getTime()) / 86400000) + 1)/7);
+};
+
+// 収穫可能時間計算
+const calcHarvestCap = (row, totalHours) => {
+  const startVal = getValue(row, ['始業', '開始', '開始時間']);
+  const endVal = getValue(row, ['終業', '終了', '終了時間']);
+
+  const parseTime = (val) => {
+    if (!val) return null;
+    if (typeof val === 'string' && val.includes(':')) {
+      const [h, m] = val.split(':').map(Number);
+      return h * 60 + m;
+    }
+    if (!isNaN(val)) {
+        return Math.round(Number(val) * 24 * 60);
+    }
+    return null;
+  };
+
+  const startMin = parseTime(startVal);
+  const endMin = parseTime(endVal);
+
+  if (startMin === null || endMin === null) return 0;
+
+  const winStart = 4 * 60;  // 4:00
+  const winEnd = 12 * 60;   // 12:00
+
+  const overlapStart = Math.max(startMin, winStart);
+  const overlapEnd = Math.min(endMin, winEnd);
+
+  const overlap = Math.max(0, overlapEnd - overlapStart);
+  const overlapHours = overlap / 60.0;
+
+  return Math.min(overlapHours, totalHours);
+};
+
+
+// --- デフォルトデータ (サンプル) ---
+const DEFAULT_DEMAND = `日付	作業	圃場名	作業時間
+2026/6/1	定植	御代田第1	30
+2026/6/1	収穫	富士見	15
+`;
+const DEFAULT_SUPPLY = `日付	氏名	区分	実働時間(h)	始業	終業
+2026/6/1	坂口 肇	社員	10	6:00	17:00
+`;
+const DEFAULT_SKILLS = `No	作業員名	人工	区分	時間区分	供給順位	備考	収穫	定植	防除	マルチ張り
+1	坂口 肇	1	社員	常勤	1		◯	◯	◯	◯
+`;
+
+
+// --- メインコンポーネント ---
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState('input');
+  const [inputTab, setInputTab] = useState('demand');
+  const [previewTab, setPreviewTab] = useState('supply');
+  const [resultTab, setResultTab] = useState('matrix');
+
+  const [demandText, setDemandText] = useState(DEFAULT_DEMAND);
+  const [supplyText, setSupplyText] = useState(DEFAULT_SUPPLY);
+  const [skillsText, setSkillsText] = useState(DEFAULT_SKILLS);
+
+  const [results, setResults] = useState([]);
+  const [calculated, setCalculated] = useState(false);
+  const [simInfo, setSimInfo] = useState({ demandPeriod: '', supplyPeriod: '', offsetMsg: '' });
+  const [diagnosis, setDiagnosis] = useState(null); // データ診断結果
+  
+  // AI分析用ステート
+  const [aiAdvice, setAiAdvice] = useState('');
+  const [isAiLoading, setIsAiLoading] = useState(false);
+
+  // プレビュー用ステート
+  const [parsedPreview, setParsedPreview] = useState({ demand: [], supply: [], skills: [] });
+  
+  // Excelライブラリ読み込み状態
+  const [xlsxReady, setXlsxReady] = useState(false);
+
+  // 各ファイルの読み込みステータス
+  const [fileStatus, setFileStatus] = useState({
+    demand: { fileName: '', loaded: false, message: '' },
+    supply: { fileName: '', loaded: false, message: '' },
+    skills: { fileName: '', loaded: false, message: '' }
+  });
+
+  const fileInputRefs = {
+    demand: useRef(null),
+    supply: useRef(null),
+    skills: useRef(null)
+  };
+
+  // SheetJS (XLSX) のロード
+  useEffect(() => {
+    const script = document.createElement('script');
+    script.src = "https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js";
+    script.async = true;
+    script.onload = () => {
+        setXlsxReady(true);
+        console.log("XLSX library loaded");
+    };
+    document.body.appendChild(script);
+    return () => {
+        document.body.removeChild(script);
+    }
+  }, []);
+
+  // リアルタイムプレビュー更新
+  useEffect(() => {
+    const d = parseTSV(demandText, 'demand');
+    const s = parseTSV(supplyText, 'supply');
+    const k = parseTSV(skillsText, 'skills');
+    setParsedPreview({
+        demand: d,
+        supply: s,
+        skills: k
+    });
+  }, [demandText, supplyText, skillsText]);
+
+
+  // 個別Excelファイル読み込みハンドラ
+  const handleFileSelect = (e, type) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    if (!xlsxReady) {
+        alert("Excel読み込みライブラリの準備中です。少々お待ちください。");
+        return;
+    }
+    
+    setFileStatus(prev => ({
+        ...prev,
+        [type]: { fileName: file.name, loaded: false, message: '読み込み中...' }
+    }));
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        try {
+            const data = new Uint8Array(e.target.result);
+            // @ts-ignore
+            const workbook = window.XLSX.read(data, { type: 'array', cellDates: true });
+            
+            let targetSheetName = '';
+            let tsv = '';
+
+            // キーワードによるシート検索
+            const keywords = {
+                demand: ['作業', '計画', '需要', 'Demand'],
+                supply: ['シミュ', '月次', '供給', 'Supply'],
+                skills: ['人員', '能力', 'スキル', 'Skill']
+            };
+            
+            const targetKeywords = keywords[type] || [];
+            targetSheetName = workbook.SheetNames.find(name => 
+                targetKeywords.some(keyword => name.includes(keyword))
+            );
+
+            if (!targetSheetName) {
+                targetSheetName = workbook.SheetNames[0];
+            }
+
+            // @ts-ignore
+            const worksheet = workbook.Sheets[targetSheetName];
+            // @ts-ignore
+            tsv = window.XLSX.utils.sheet_to_csv(worksheet, { FS: '\t', dateNF: 'yyyy/mm/dd' });
+
+            if (!tsv.trim()) {
+                throw new Error("データが空です");
+            }
+
+            if (type === 'demand') setDemandText(tsv);
+            if (type === 'supply') setSupplyText(tsv);
+            if (type === 'skills') setSkillsText(tsv);
+
+            setFileStatus(prev => ({
+                ...prev,
+                [type]: { 
+                    fileName: file.name, 
+                    loaded: true, 
+                    message: `完了 (シート: ${targetSheetName})` 
+                }
+            }));
+            
+            // 読み込み後は確認タブへ誘導
+            setActiveTab('preview');
+            setPreviewTab(type);
+
+        } catch (err) {
+            console.error(err);
+            setFileStatus(prev => ({
+                ...prev,
+                [type]: { 
+                    fileName: file.name, 
+                    loaded: false, 
+                    message: 'エラー: 読み込み失敗' 
+                }
+            }));
+        }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const clearFile = (type) => {
+      setFileStatus(prev => ({
+          ...prev,
+          [type]: { fileName: '', loaded: false, message: '' }
+      }));
+      if (fileInputRefs[type].current) {
+          fileInputRefs[type].current.value = '';
+      }
+  };
+
+  // CSVダウンロード機能
+  const handleDownloadCSV = () => {
+    if (results.length === 0) {
+        alert("ダウンロードするデータがありません");
+        return;
+    }
+
+    // CSVヘッダー定義
+    const csvHeaders = ['日付', '週', '作業', '圃場名', '需要(h)', '供給(h)', '不足(h)', '充足率(%)', '判定'];
+    
+    // データ変換
+    const csvRows = results.map(r => {
+        const rate = r.demand > 0 ? (r.assigned / r.demand * 100).toFixed(1) : '100.0';
+        const status = r.gap > 0.01 ? '不足あり' : 'OK';
+        return [
+            r.date,
+            `第${r.week}週`,
+            r.task,
+            r.location || '', // 圃場名
+            r.demand.toFixed(2),
+            r.assigned.toFixed(2),
+            r.gap.toFixed(2),
+            rate,
+            status
+        ].join(',');
+    });
+
+    // BOM付きCSV文字列作成
+    const csvContent = '\uFEFF' + [csvHeaders.join(','), ...csvRows].join('\n');
+    
+    // ダウンロードリンク生成
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `需給分析結果_${formatDate(new Date())}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Gemini API呼び出し関数
+  const handleAiAnalysis = async () => {
+    if (!results || results.length === 0) {
+      alert("分析データがありません。先に計算実行を行ってください。");
+      return;
+    }
+    
+    setIsAiLoading(true);
+    setAiAdvice('');
+
+    // 1. 分析用データのサマリ作成
+    const weeklySummary = {};
+    const taskSummary = {};
+    let totalGap = 0;
+    
+    results.forEach(r => {
+        // 週次不足
+        if (!weeklySummary[r.week]) weeklySummary[r.week] = 0;
+        weeklySummary[r.week] += r.gap > 0 ? r.gap : 0;
+        
+        // 作業別不足
+        if (r.gap > 0) {
+            if (!taskSummary[r.task]) taskSummary[r.task] = 0;
+            taskSummary[r.task] += r.gap;
+            totalGap += r.gap;
+        }
+    });
+
+    // 不足が多い週トップ5
+    const topShortageWeeks = Object.entries(weeklySummary)
+        .sort(([, a], [, b]) => b - a)
+        .filter(([, gap]) => gap > 0)
+        .slice(0, 5)
+        .map(([week, gap]) => `第${week}週: ${gap.toFixed(1)}時間不足`);
+
+    // 不足が多い作業トップ5
+    const topShortageTasks = Object.entries(taskSummary)
+        .sort(([, a], [, b]) => b - a)
+        .slice(0, 5)
+        .map(([task, gap]) => `${task}: ${gap.toFixed(1)}時間不足`);
+
+    const promptText = `
+あなたは農業経営のプロフェッショナルなコンサルタントです。
+以下の労働力需給ギャップ分析データに基づき、不足を解消するための具体的かつ実現可能な対策を3つ提案してください。
+
+【分析データ概要】
+- 計算期間: ${simInfo.demandPeriod}
+- 合計不足時間: ${totalGap.toFixed(1)}時間
+- 特に労働力が不足している週: ${topShortageWeeks.join(', ')}
+- 特に人手が足りない作業: ${topShortageTasks.join(', ')}
+
+【回答の要件】
+- 農業現場の実情に即したアドバイスにしてください（例：臨時雇用の検討、作業時期の前倒し・後ろ倒し、作業工程の省力化など）。
+- 丁寧で励ますような口調で回答してください。
+- 各対策にはタイトルを付け、具体的なアクションを記述してください。
+    `;
+
+    try {
+        const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    contents: [{
+                        parts: [{ text: promptText }]
+                    }]
+                })
+            }
+        );
+
+        const data = await response.json();
+        const advice = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        
+        if (advice) {
+            setAiAdvice(advice);
+        } else {
+            throw new Error('AIからの応答が空でした。');
+        }
+
+    } catch (error) {
+        console.error("AI Analysis Error:", error);
+        setAiAdvice("申し訳ありません。AI分析中にエラーが発生しました。\nネットワーク接続を確認し、しばらく待ってから再度お試しください。");
+    } finally {
+        setIsAiLoading(false);
+    }
+  };
+
+  // シミュレーション実行関数
+  const runSimulation = () => {
+    try {
+      // 1. データパース
+      const demandInfo = parseTSV(demandText, 'demand');
+      const supplyInfo = parseTSV(supplyText, 'supply');
+      // const skillsInfo = parseTSV(skillsText, 'skills'); // 内部で処理するため不要
+
+      const demandData = demandInfo.data;
+      const supplyData = supplyInfo.data;
+
+      if(demandData.length === 0) throw new Error("作業計画データが読み込めません。ヘッダー行（『日付』『作業』など）が見つかりません。");
+      if(supplyData.length === 0) throw new Error("供給データが読み込めません。ヘッダー行（『氏名』『日付』など）が見つかりません。");
+
+      // 2. スキルDB構築 (新ロジック使用)
+      const workersList = parseSkillData(skillsText);
+      const skillDb = {};
+      const skillDbNormalized = {}; 
+
+      workersList.forEach(w => {
+          skillDb[w.name] = w;
+          skillDbNormalized[normalizeName(w.name)] = w;
+      });
+
+      const traineeTemplate = skillDb['実習生A'] || skillDbNormalized['実習生A'] || { rank: 999, skills: {} };
+
+      // 診断ロジック
+      const supplyNames = new Set();
+      supplyData.forEach(r => { 
+          const name = getValue(r, ['氏名', '名前', '作業員名']);
+          if(name) supplyNames.add(name); 
+      });
+      
+      const matchedNames = [];
+      const unmatchedNames = [];
+      
+      supplyNames.forEach(name => {
+          if (skillDb[name] || skillDbNormalized[normalizeName(name)]) {
+              matchedNames.push(name);
+          } else {
+              const surname = String(name).split(/[\s　]+/)[0];
+              const normSurname = normalizeName(surname);
+              
+              const row = supplyData.find(r => getValue(r, ['氏名', '名前', '作業員名']) === name);
+              const cat = getValue(row, ['区分', '属性']);
+              const isTrainee = cat && String(cat).includes('実習生');
+              
+              if (skillDb[surname] || skillDbNormalized[normSurname] || isTrainee) {
+                   matchedNames.push(name + "(苗字or実習生)");
+              } else {
+                   unmatchedNames.push(name);
+              }
+          }
+      });
+      
+      setDiagnosis({
+          totalWorkers: supplyNames.size,
+          matchedCount: matchedNames.length,
+          unmatchedCount: unmatchedNames.length,
+          unmatchedList: unmatchedNames.slice(0, 10) 
+      });
+
+      // 年補正ロジック
+      let demandStartYear = new Date().getFullYear();
+      const validDemandDates = demandData.map(r => new Date(getValue(r, ['日付', '年月日']))).filter(d => !isNaN(d.getTime()));
+      if (validDemandDates.length > 0) {
+          const minDate = new Date(Math.min(...validDemandDates));
+          demandStartYear = minDate.getFullYear();
+      }
+
+      let supplyStartYear = null;
+      for (const row of supplyData) {
+          const d = new Date(getValue(row, ['日付', '年月日']));
+          if (!isNaN(d.getTime())) {
+              supplyStartYear = d.getFullYear();
+              break;
+          }
+      }
+
+      let yearOffset = 0;
+      if (supplyStartYear !== null) {
+          yearOffset = demandStartYear - supplyStartYear;
+      }
+
+      // データグループ化
+      const groupedSupply = {};
+      let minSDate = null, maxSDate = null;
+
+      supplyData.forEach(row => {
+        let date = new Date(getValue(row, ['日付', '年月日']));
+        if (isNaN(date.getTime())) return;
+        
+        if (yearOffset !== 0) {
+            date.setFullYear(date.getFullYear() + yearOffset);
+        }
+        
+        const dateStr = formatDate(date);
+        if (!groupedSupply[dateStr]) groupedSupply[dateStr] = [];
+        row._dateObj = date;
+        groupedSupply[dateStr].push(row);
+
+        if(!minSDate || date < minSDate) minSDate = date;
+        if(!maxSDate || date > maxSDate) maxSDate = date;
+      });
+
+      const groupedDemand = {};
+      const uniqueDates = [];
+      let minDDate = null, maxDDate = null;
+      
+      demandData.forEach(row => {
+        const date = new Date(getValue(row, ['日付', '年月日']));
+        if (isNaN(date.getTime())) return;
+        const dateStr = formatDate(date);
+        
+        if (!groupedDemand[dateStr]) {
+            groupedDemand[dateStr] = [];
+            uniqueDates.push(dateStr);
+        }
+        
+        const taskName = getValue(row, ['作業', '作業名', '品目']);
+        row._taskName = taskName;
+        row._priority = TASK_PRIORITIES[taskName] || DEFAULT_PRIORITY;
+        groupedDemand[dateStr].push(row);
+
+        if(!minDDate || date < minDDate) minDDate = date;
+        if(!maxDDate || date > maxDDate) maxDDate = date;
+      });
+      
+      uniqueDates.sort();
+      
+      setSimInfo({
+          demandPeriod: minDDate ? `${formatDate(minDDate)} 〜 ${formatDate(maxDDate)}` : 'データなし',
+          supplyPeriod: minSDate ? `${formatDate(minSDate)} 〜 ${formatDate(maxSDate)}` : 'データなし',
+          offsetMsg: yearOffset !== 0 ? `(供給データを ${yearOffset}年分 ずらして計算しました)` : '(日付補正なし)'
+      });
+
+      // シミュレーションループ
+      const simResults = [];
+
+      uniqueDates.forEach(dateStr => {
+        const dayDemand = groupedDemand[dateStr];
+        dayDemand.sort((a, b) => a._priority - b._priority); 
+
+        const daySupply = groupedSupply[dateStr] || [];
+        
+        // 作業員リスト作成
+        let workers = [];
+        daySupply.forEach((row, idx) => {
+            const name = getValue(row, ['氏名', '名前', '作業員名']);
+            const category = getValue(row, ['区分', '属性']);
+            const hoursVal = getValue(row, ['実働時間(h)', '実働時間', '勤務時間']);
+            const totalHours = parseFloat(hoursVal || 0);
+
+            if (totalHours <= 0) return;
+
+            let info = { rank: 9999, skills: {} };
+            
+            if (skillDb[name]) info = skillDb[name];
+            else if (skillDbNormalized[normalizeName(name)]) info = skillDbNormalized[normalizeName(name)];
+            else {
+                const surname = String(name).split(/[\s　]+/)[0];
+                const normSurname = normalizeName(surname);
+                
+                if (skillDb[surname]) info = skillDb[surname];
+                else if (skillDbNormalized[normSurname]) info = skillDbNormalized[normSurname];
+                else if (category && String(category).includes('実習生')) info = traineeTemplate;
+            }
+
+            const hCap = calcHarvestCap(row, totalHours);
+
+            workers.push({
+                id: idx,
+                name: name,
+                rank: info.rank,
+                skills: info.skills,
+                totalCap: totalHours,
+                harvestCap: hCap
+            });
+        });
+
+        workers.sort((a, b) => a.rank - b.rank);
+
+        dayDemand.forEach(taskRow => {
+            const taskName = taskRow._taskName;
+            const timeVal = getValue(taskRow, ['作業時間', '時間', '工数']);
+            let hoursNeeded = parseFloat(timeVal || 0);
+            const skillNeeded = TASK_SKILL_MAP[taskName] || taskName;
+            const location = getValue(taskRow, ['圃場', '圃場名', '畑', '場所', '生産圃場']) || '-';
+
+            let hoursAssigned = 0;
+            const initialNeeded = hoursNeeded;
+
+            for (const w of workers) {
+                if (hoursNeeded <= 0.01) break;
+                if (w.totalCap <= 0.01) continue;
+
+                let canDo = false;
+                
+                // スキルマッチングロジック: TASK_SKILL_MAPで変換したキー または そのままの作業名
+                if (w.skills) {
+                    if (w.skills[skillNeeded] === 1 || w.skills[taskName] === 1) {
+                         canDo = true;
+                    }
+                }
+
+                if (canDo) {
+                    let available = w.totalCap;
+                    if (skillNeeded === '収穫') {
+                        available = Math.min(available, w.harvestCap);
+                    }
+
+                    const allocate = Math.min(available, hoursNeeded);
+
+                    if (allocate > 0) {
+                        w.totalCap -= allocate;
+                        if (skillNeeded === '収穫') {
+                            w.harvestCap -= allocate;
+                        } else {
+                            w.harvestCap = Math.min(w.harvestCap, w.totalCap);
+                        }
+                        
+                        hoursNeeded -= allocate;
+                        hoursAssigned += allocate;
+                    }
+                }
+            }
+
+            simResults.push({
+                date: dateStr,
+                week: getWeekNumber(new Date(dateStr)),
+                task: taskName,
+                priority: taskRow._priority,
+                demand: initialNeeded,
+                assigned: hoursAssigned,
+                gap: initialNeeded - hoursAssigned,
+                location: location
+            });
+        });
+      });
+
+      setResults(simResults);
+      setCalculated(true);
+      setActiveTab('result');
+
+    } catch (e) {
+      alert("エラーが発生しました:\n" + e.message);
+    }
+  };
+
+  // --- プレビュー用コンポーネント ---
+  const DataPreviewTable = ({ data, headers, rowIndex, rawLines }) => {
+      // マトリックス形式の場合は rawLines をそのまま表示する（先頭20行くらい）
+      if (rawLines && rawLines.length > 0 && headers.length === 0) {
+           return (
+             <div className="overflow-x-auto border rounded-md">
+                <div className="bg-orange-50 p-2 text-xs text-orange-700 border-b">
+                    ※ マトリックス形式、またはヘッダーが見つからないため、生データを表示します。
+                </div>
+                <table className="min-w-full divide-y divide-gray-200 text-xs">
+                    <tbody className="bg-white divide-y divide-gray-200">
+                        {rawLines.slice(0, 20).map((row, i) => (
+                            <tr key={i}>
+                                {row.map((cell, j) => (
+                                    <td key={j} className={`px-2 py-1 border whitespace-nowrap ${i===0 ? 'font-bold bg-gray-50':''}`}>
+                                        {cell}
+                                    </td>
+                                ))}
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+           );
+      }
+
+      if(!data || data.length === 0) return <div className="p-4 text-gray-400 text-sm">データが読み込まれていません</div>;
+
+      return (
+        <div className="overflow-x-auto border rounded-md">
+            <div className="bg-blue-50 p-2 text-xs text-blue-700 border-b">
+                ※ {rowIndex + 1}行目をヘッダーとして認識しました。先頭10件を表示しています。
+            </div>
+            <table className="min-w-full divide-y divide-gray-200 text-xs">
+                <thead className="bg-gray-50">
+                    <tr>
+                        {headers.map((h, i) => <th key={i} className="px-3 py-2 text-left font-medium text-gray-500 whitespace-nowrap">{h}</th>)}
+                    </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                    {data.slice(0, 10).map((row, i) => (
+                        <tr key={i}>
+                            {headers.map((h, j) => (
+                                <td key={j} className="px-3 py-2 text-gray-700 whitespace-nowrap">{row[h]}</td>
+                            ))}
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+        </div>
+      );
+  };
+
+  // --- 表示用コンポーネント ---
+
+  const MatrixView = () => {
+    if (results.length === 0) return <p className="p-4 text-gray-500">データがありません</p>;
+
+    const tasks = [...new Set(results.map(r => r.task))].sort();
+    const weeks = [...new Set(results.map(r => r.week))].sort((a,b)=>a-b);
+    
+    const matrix = {};
+    results.forEach(r => {
+        if (!matrix[r.week]) matrix[r.week] = {};
+        if (!matrix[r.week][r.task]) matrix[r.week][r.task] = 0;
+        matrix[r.week][r.task] += r.gap;
+    });
+
+    return (
+      <div className="overflow-x-auto">
+        <table className="min-w-full divide-y divide-gray-200 border text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              <th className="px-3 py-2 text-left font-medium text-gray-500 sticky left-0 bg-gray-50">週No.</th>
+              {tasks.map(t => <th key={t} className="px-3 py-2 text-center font-medium text-gray-500">{t}</th>)}
+            </tr>
+          </thead>
+          <tbody className="bg-white divide-y divide-gray-200">
+            {weeks.map(w => (
+              <tr key={w}>
+                <td className="px-3 py-2 font-bold text-gray-700 sticky left-0 bg-white border-r">{w}</td>
+                {tasks.map(t => {
+                  const val = matrix[w]?.[t] || 0;
+                  const isGap = val > 0.1;
+                  return (
+                    <td key={t} className={`px-3 py-2 text-center border-l ${isGap ? 'bg-red-100 text-red-800 font-bold' : 'text-gray-400'}`}>
+                      {val > 0 ? val.toFixed(1) : '-'}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  const DailyView = () => (
+    <div className="overflow-x-auto max-h-[500px]">
+      <table className="min-w-full divide-y divide-gray-200 text-sm">
+        <thead className="bg-gray-50 sticky top-0">
+          <tr>
+            <th className="px-4 py-2 text-left">日付</th>
+            <th className="px-4 py-2 text-left">週</th>
+            <th className="px-4 py-2 text-left">作業</th>
+            <th className="px-4 py-2 text-left">圃場名</th>
+            <th className="px-4 py-2 text-right">需要(h)</th>
+            <th className="px-4 py-2 text-right">割当(h)</th>
+            <th className="px-4 py-2 text-right">不足(h)</th>
+          </tr>
+        </thead>
+        <tbody className="bg-white divide-y divide-gray-200">
+          {results.map((r, i) => (
+            <tr key={i} className={r.gap > 0 ? "bg-red-50" : ""}>
+              <td className="px-4 py-2 whitespace-nowrap">{r.date}</td>
+              <td className="px-4 py-2">{r.week}</td>
+              <td className="px-4 py-2">{r.task}</td>
+              <td className="px-4 py-2 text-gray-600">{r.location}</td>
+              <td className="px-4 py-2 text-right">{r.demand.toFixed(1)}</td>
+              <td className="px-4 py-2 text-right">{r.assigned.toFixed(1)}</td>
+              <td className={`px-4 py-2 text-right font-bold ${r.gap > 0 ? 'text-red-600' : 'text-gray-400'}`}>
+                {r.gap > 0 ? r.gap.toFixed(1) : 'OK'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+
+  const WeeklyChart = () => {
+    const summary = useMemo(() => {
+        const sum = {};
+        results.forEach(r => {
+            if (!sum[r.week]) sum[r.week] = { week: `第${r.week}週`, demand: 0, assigned: 0, gap: 0 };
+            sum[r.week].demand += r.demand;
+            sum[r.week].assigned += r.assigned;
+            sum[r.week].gap += r.gap;
+        });
+        return Object.values(sum).sort((a,b) => parseInt(a.week.replace(/\D/g,'')) - parseInt(b.week.replace(/\D/g,'')));
+    }, [results]);
+
+    return (
+        <div className="h-64 w-full">
+            <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={summary}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="week" />
+                    <YAxis />
+                    <RechartsTooltip />
+                    <Legend />
+                    <Bar dataKey="assigned" name="充足" stackId="a" fill="#82ca9d" />
+                    <Bar dataKey="gap" name="不足" stackId="a" fill="#ff8042" />
+                </BarChart>
+            </ResponsiveContainer>
+        </div>
+    );
+  };
+
+  const FileUploadCard = ({ type, title, icon: Icon }) => {
+      const status = fileStatus[type];
+      const isLoaded = status.loaded;
+      
+      return (
+        <div className={`p-4 rounded-lg border-2 transition-all ${
+            inputTab === type ? 'border-emerald-500 bg-emerald-50' : 'border-dashed border-gray-300 bg-gray-50'
+        }`}>
+            <div className="flex justify-between items-start mb-2">
+                <div className="flex items-center text-gray-700 font-bold">
+                    <Icon className="w-5 h-5 mr-2" />
+                    {title}
+                </div>
+                {isLoaded ? (
+                    <button onClick={() => clearFile(type)} className="text-gray-400 hover:text-red-500">
+                        <X className="w-4 h-4" />
+                    </button>
+                ) : (
+                    <span className="text-xs text-gray-400 bg-gray-200 px-2 py-1 rounded">未選択</span>
+                )}
+            </div>
+            
+            {!isLoaded ? (
+                <div>
+                     <input 
+                        type="file" 
+                        accept=".xlsx, .xls" 
+                        className="block w-full text-sm text-gray-500
+                        file:mr-4 file:py-2 file:px-4
+                        file:rounded-full file:border-0
+                        file:text-xs file:font-semibold
+                        file:bg-emerald-100 file:text-emerald-700
+                        hover:file:bg-emerald-200 cursor-pointer"
+                        onChange={(e) => handleFileSelect(e, type)}
+                        ref={fileInputRefs[type]}
+                        disabled={!xlsxReady}
+                    />
+                    <p className="mt-2 text-xs text-gray-400">Excelファイル (.xlsx)</p>
+                </div>
+            ) : (
+                <div>
+                     <div className="flex items-center text-sm text-emerald-700 font-medium mb-1">
+                        <CheckCircle2 className="w-4 h-4 mr-1 flex-shrink-0" />
+                        <span className="truncate">{status.fileName}</span>
+                    </div>
+                    <div className="text-xs text-emerald-600 opacity-80 pl-5">
+                        {status.message}
+                    </div>
+                </div>
+            )}
+        </div>
+      );
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-900 font-sans">
+      <header className="bg-emerald-700 text-white p-4 shadow-lg">
+        <div className="max-w-7xl mx-auto flex justify-between items-center">
+          <div className="flex items-center space-x-2">
+            <Briefcase className="h-6 w-6" />
+            <h1 className="text-xl font-bold">トップリバー 労働力需給ギャップ分析</h1>
+          </div>
+          <div className="text-sm opacity-80">
+            Ver 2.1 (CSV圃場名追加)
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto p-4 md:p-6 space-y-6">
+        
+        {/* Navigation Tabs */}
+        <div className="flex space-x-1 bg-white p-1 rounded-lg shadow border">
+          <button
+            onClick={() => setActiveTab('input')}
+            className={`flex-1 flex items-center justify-center py-2 px-4 rounded-md text-sm font-medium transition-colors ${
+              activeTab === 'input' ? 'bg-emerald-100 text-emerald-800' : 'text-gray-600 hover:bg-gray-50'
+            }`}
+          >
+            <Upload className="w-4 h-4 mr-2" />
+            1. ファイル読込
+          </button>
+          <ArrowRight className="text-gray-300 self-center mx-2" />
+          <button
+            onClick={() => setActiveTab('preview')}
+            className={`flex-1 flex items-center justify-center py-2 px-4 rounded-md text-sm font-medium transition-colors ${
+              activeTab === 'preview' ? 'bg-indigo-100 text-indigo-800' : 'text-gray-600 hover:bg-gray-50'
+            }`}
+          >
+            <Eye className="w-4 h-4 mr-2" />
+            2. データ確認
+          </button>
+          <ArrowRight className="text-gray-300 self-center mx-2" />
+          <button
+            onClick={() => {
+                if(!calculated) runSimulation();
+                else setActiveTab('result');
+            }}
+            className={`flex-1 flex items-center justify-center py-2 px-4 rounded-md text-sm font-medium transition-colors ${
+              activeTab === 'result' ? 'bg-blue-100 text-blue-800' : 'text-gray-600 hover:bg-gray-50'
+            }`}
+          >
+            <BarChart3 className="w-4 h-4 mr-2" />
+            3. 分析結果
+          </button>
+        </div>
+
+        {/* INPUT SECTION */}
+        {activeTab === 'input' && (
+          <div className="bg-white rounded-xl shadow-sm border p-6 animate-in fade-in slide-in-from-bottom-4">
+            
+            <div className="mb-6">
+                <h2 className="text-md font-bold mb-4 flex items-center text-gray-800">
+                    <FileSpreadsheet className="w-5 h-5 mr-2 text-green-600" />
+                    Excelファイル読み込み
+                </h2>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <FileUploadCard type="demand" title="作業計画 (需要)" icon={Calendar} />
+                    <FileUploadCard type="supply" title="月次シミュ (供給)" icon={Users} />
+                    <FileUploadCard type="skills" title="人員能力表" icon={Briefcase} />
+                </div>
+                <div className="mt-3 bg-blue-50 text-blue-800 text-xs p-3 rounded flex items-start">
+                    <AlertCircle className="w-4 h-4 mr-2 flex-shrink-0 mt-0.5" />
+                    ※ 新フォーマット（列が作業員、行がスキル）の人員能力表に対応しました。<br/>
+                    ※ ファイルを読み込んだら、必ず「2. データ確認」で中身が正しく表示されているかチェックしてください。
+                </div>
+            </div>
+            
+             <div className="mt-6 flex justify-end">
+                <button
+                    onClick={() => setActiveTab('preview')}
+                    className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2 rounded-lg font-bold shadow-md flex items-center transition-all transform hover:scale-105"
+                >
+                    <Eye className="w-4 h-4 mr-2" />
+                    データの中身を確認する
+                </button>
+            </div>
+          </div>
+        )}
+
+        {/* PREVIEW SECTION */}
+        {activeTab === 'preview' && (
+          <div className="bg-white rounded-xl shadow-sm border p-6 animate-in fade-in slide-in-from-bottom-4">
+             <h2 className="text-lg font-bold mb-4 flex items-center">
+              <Eye className="w-5 h-5 mr-2 text-indigo-600" />
+              読み込みデータの確認 (紐づけチェック)
+            </h2>
+            <p className="text-sm text-gray-500 mb-6">
+               Excelからシステムが読み取ったデータです。<br/>
+               <span className="text-red-600 font-bold">「氏名」「日付」「実働時間」などの列名が正しく表示されていますか？</span><br/>
+            </p>
+
+            <div className="flex border-b mb-4">
+              {[
+                  {id: 'demand', label: '作業計画', icon: Calendar},
+                  {id: 'supply', label: '月次シミュ(供給)', icon: Users},
+                  {id: 'skills', label: '人員能力表', icon: Briefcase}
+              ].map(tab => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setPreviewTab(tab.id)}
+                    className={`px-4 py-2 flex items-center border-b-2 font-medium text-sm transition-colors ${
+                        previewTab === tab.id 
+                        ? 'border-indigo-500 text-indigo-700 bg-indigo-50' 
+                        : 'border-transparent text-gray-500 hover:text-gray-700'
+                    }`}
+                  >
+                    <tab.icon className="w-4 h-4 mr-2" />
+                    {tab.label}
+                  </button>
+              ))}
+            </div>
+
+            <div className="relative min-h-[300px]">
+                <DataPreviewTable 
+                    data={parsedPreview[previewTab].data} 
+                    headers={parsedPreview[previewTab].headers}
+                    rowIndex={parsedPreview[previewTab].headerRowIndex}
+                    rawLines={parsedPreview[previewTab].rawLines}
+                />
+            </div>
+
+            <div className="mt-6 flex justify-end">
+                <button
+                    onClick={runSimulation}
+                    className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-2 rounded-lg font-bold shadow-md flex items-center transition-all transform hover:scale-105"
+                >
+                    <Save className="w-4 h-4 mr-2" />
+                    計算実行
+                </button>
+            </div>
+          </div>
+        )}
+
+
+        {/* RESULTS SECTION */}
+        {activeTab === 'result' && (
+          <div className="bg-white rounded-xl shadow-sm border p-6 animate-in fade-in slide-in-from-bottom-4">
+             <div className="flex justify-between items-center mb-6">
+                <h2 className="text-lg font-bold flex items-center">
+                <BarChart3 className="w-5 h-5 mr-2 text-blue-600" />
+                分析結果
+                </h2>
+                <div className="flex items-center space-x-4">
+                    <button
+                        onClick={handleDownloadCSV}
+                        className="flex items-center text-sm font-bold text-gray-600 hover:text-blue-600 bg-white border border-gray-300 hover:border-blue-500 px-3 py-1.5 rounded-md shadow-sm transition-colors"
+                    >
+                        <Download className="w-4 h-4 mr-2" />
+                        CSVダウンロード
+                    </button>
+                    <div className="flex space-x-2 bg-gray-100 p-1 rounded-lg">
+                        {['matrix', 'daily', 'weekly'].map(mode => (
+                            <button
+                                key={mode}
+                                onClick={() => setResultTab(mode)}
+                                className={`px-3 py-1 rounded-md text-sm font-medium ${
+                                    resultTab === mode ? 'bg-white shadow text-gray-900' : 'text-gray-500'
+                                }`}
+                            >
+                                {mode === 'matrix' ? '不足表' : mode === 'daily' ? '日次リスト' : '週次集計'}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+            </div>
+
+            {/* Sim Info Debug */}
+            <div className="mb-4 text-xs bg-gray-50 p-2 rounded text-gray-500 flex flex-wrap items-center justify-between">
+                <div className="flex items-center">
+                    <Info className="w-4 h-4 mr-2" />
+                    <span className="mr-2">
+                        計算対象期間: 
+                        <span className="ml-1 font-mono">計画[{simInfo.demandPeriod}]</span> vs 
+                        <span className="ml-1 font-mono">供給[{simInfo.supplyPeriod}]</span>
+                    </span>
+                    <span className="text-emerald-600 font-medium">
+                        {simInfo.offsetMsg}
+                    </span>
+                </div>
+            </div>
+
+            {/* Diagnosis Report */}
+            {diagnosis && (
+                <div className={`mb-6 p-4 border rounded-lg ${diagnosis.totalWorkers === 0 ? 'bg-red-50 border-red-200' : 'bg-orange-50 border-orange-200'}`}>
+                    <h3 className={`text-sm font-bold mb-2 flex items-center ${diagnosis.totalWorkers === 0 ? 'text-red-800' : 'text-orange-800'}`}>
+                        <Search className="w-4 h-4 mr-2" />
+                        データ診断レポート
+                    </h3>
+                    <div className="flex flex-wrap gap-4 text-sm mb-2">
+                         <div className="bg-white px-3 py-1 rounded border">
+                             供給データの人数: <strong>{diagnosis.totalWorkers}名</strong>
+                         </div>
+                         <div className="bg-white px-3 py-1 rounded border text-emerald-700">
+                             スキル表と一致: <strong>{diagnosis.matchedCount}名</strong>
+                         </div>
+                         <div className="bg-white px-3 py-1 rounded border text-red-600">
+                             不一致 (スキル無し扱い): <strong>{diagnosis.unmatchedCount}名</strong>
+                         </div>
+                    </div>
+                    
+                    {diagnosis.totalWorkers === 0 && (
+                        <div className="text-sm text-red-700 mt-2 font-bold flex items-center">
+                            <AlertTriangle className="w-4 h-4 mr-2" />
+                            エラー: 供給データが正しく読み込めていません。
+                            <ul className="list-disc ml-8 mt-1 font-normal text-xs">
+                                <li><strong>2. データ確認</strong> タブで、列名が正しく表示されているか確認してください。</li>
+                                <li>Excelシートの1行目にタイトルが入っていませんか？</li>
+                            </ul>
+                        </div>
+                    )}
+
+                    {diagnosis.totalWorkers > 0 && diagnosis.unmatchedList.length > 0 && (
+                        <div className="text-xs text-red-700 mt-2">
+                            <span className="font-bold">以下の作業員がスキル表に見つかりません（上位10件）:</span>
+                            <div className="mt-1 font-mono bg-white p-2 rounded border border-orange-100">
+                                {diagnosis.unmatchedList.join(', ')}
+                            </div>
+                            <p className="mt-1 opacity-75">※ 名前が一致しない場合、その人は作業が割り当てられません。</p>
+                        </div>
+                    )}
+                    {diagnosis.totalWorkers > 0 && diagnosis.unmatchedCount === 0 && (
+                        <div className="text-xs text-emerald-700 font-bold mt-2 flex items-center">
+                            <CheckCircle2 className="w-4 h-4 mr-1" />
+                            全員のマッチングに成功しました！
+                        </div>
+                    )}
+                </div>
+            )}
+            
+            {/* AI Analysis Button Section */}
+            <div className="mb-6 bg-gradient-to-r from-purple-50 to-indigo-50 p-4 rounded-xl border border-indigo-100 shadow-sm">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div>
+                        <h3 className="font-bold text-indigo-900 flex items-center mb-1">
+                            <Sparkles className="w-5 h-5 mr-2 text-indigo-500" />
+                            AI対策アドバイザー
+                        </h3>
+                        <p className="text-sm text-indigo-700 opacity-80">
+                            計算結果を分析し、不足を解消するための具体的な対策をAIが提案します。
+                        </p>
+                    </div>
+                    <button
+                        onClick={handleAiAnalysis}
+                        disabled={isAiLoading}
+                        className={`px-5 py-2.5 rounded-lg font-bold text-white shadow-md flex items-center justify-center transition-all ${
+                            isAiLoading 
+                            ? 'bg-gray-400 cursor-not-allowed' 
+                            : 'bg-indigo-600 hover:bg-indigo-700 hover:shadow-lg transform hover:-translate-y-0.5'
+                        }`}
+                    >
+                        {isAiLoading ? (
+                            <>
+                                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                分析中...
+                            </>
+                        ) : (
+                            <>
+                                <Sparkles className="w-4 h-4 mr-2" />
+                                AIで対策を提案
+                            </>
+                        )}
+                    </button>
+                </div>
+
+                {/* AI Result Display */}
+                {aiAdvice && (
+                    <div className="mt-4 pt-4 border-t border-indigo-200 animate-in fade-in">
+                        <div className="bg-white p-5 rounded-lg border border-indigo-100 shadow-inner">
+                            <h4 className="font-bold text-gray-800 mb-3 flex items-center">
+                                <Sparkles className="w-4 h-4 mr-2 text-yellow-500" />
+                                AIからの提案レポート
+                            </h4>
+                            <div className="prose prose-sm max-w-none text-gray-700 whitespace-pre-wrap leading-relaxed">
+                                {aiAdvice}
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </div>
+
+            {resultTab === 'matrix' && (
+                <div>
+                    <h3 className="text-sm font-bold text-gray-500 mb-2 uppercase tracking-wide">作業別 週次不足ヒートマップ (赤セルが不足)</h3>
+                    <MatrixView />
+                    <p className="mt-4 text-xs text-gray-400">※ 数値は「不足時間(h)」を表します。</p>
+                </div>
+            )}
+
+            {resultTab === 'daily' && (
+                <div>
+                     <h3 className="text-sm font-bold text-gray-500 mb-2 uppercase tracking-wide">日次詳細データ</h3>
+                    <DailyView />
+                </div>
+            )}
+
+            {resultTab === 'weekly' && (
+                <div>
+                    <h3 className="text-sm font-bold text-gray-500 mb-4 uppercase tracking-wide">週次 充足/不足グラフ</h3>
+                    <WeeklyChart />
+                </div>
+            )}
+
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
