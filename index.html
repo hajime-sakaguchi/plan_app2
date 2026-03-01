@@ -1,363 +1,380 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { AlertCircle, Calendar, Users, Briefcase, BarChart3, Table, ArrowRight, Save, Upload, FileSpreadsheet, CheckCircle2, AlertTriangle, FileInput, X, Info, Search, Eye, Sparkles, Loader2, Download, ChevronRight } from 'lucide-react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer } from 'recharts';
-
-// --- Gemini API Key ---
-const apiKey = ""; // 実行環境により自動注入されます
-
-// --- 1. 定数・設定定義 ---
-const TASK_SKILL_MAP = {
-  '除草剤散布（ブーム）': '除草剤ブーム',
-  '除草剤散布（手ざお）': '除草剤手ざお',
-  '草刈（定植後）': '草刈定植後',
-  '草刈（定植前）': '草刈定植前',
-  '潅水（ブーム）': '潅水ブーム',
-  '追肥': '追肥（次作用）',
-  '追肥（次作用）': '追肥（次作用）',
-  '畝立て': '畝立て',
-  '中耕': '中耕',
-  '耕耘': '耕耘',
-  '施肥': '施肥',
-  'マルチ張り': 'マルチ張り',
-  '定植': '定植',
-  '収穫': '収穫',
-  '防除': '防除',
-  'マルチ掃除': 'マルチ掃除',
-  'マルチ剥ぎ': 'マルチ剥ぎ',
-  '荒起こし': '荒起こし',
-  '草取り': '草取り'
-};
-
-const TASK_PRIORITIES = {
-  '収穫': 10, '定植': 20, 'マルチ張り': 30, '畝立て': 30, '耕耘': 30,
-  '施肥': 30, '中耕': 30, '防除': 40, '潅水（ブーム）': 40, '追肥': 40,
-  '追肥（次作用）': 40, '除草剤散布（ブーム）': 40, '除草剤散布（手ざお）': 40,
-  '草刈（定植前）': 40, '草刈（定植後）': 40, '草取り': 40, 'マルチ剥ぎ': 50,
-  '荒起こし': 50, 'マルチ掃除': 50
-};
-
-const DEFAULT_PRIORITY = 99;
-
-// --- 2. ヘルパー関数 ---
-const normalizeName = (name) => {
-  if (!name) return "";
-  return String(name).replace(/[\s　]+/g, "").trim();
-};
-
-const findHeaderRowIndex = (lines, keywords) => {
-  for (let i = 0; i < Math.min(lines.length, 30); i++) {
-    const line = lines[i];
-    if (keywords.some(k => line.includes(k))) return i;
-  }
-  return 0;
-};
-
-const getValue = (row, keys) => {
-  if (!row) return undefined;
-  for (const key of keys) {
-    if (row[key] !== undefined && row[key] !== "") return row[key];
-  }
-  return undefined;
-};
-
-const parseTSV = (text, type) => {
-  const lines = text.trim().split('\n');
-  if (lines.length === 0) return { data: [], headers: [], headerRowIndex: 0, rawLines: [] };
-
-  const rawLines = lines.map(line => line.split('\t').map(c => c.trim()));
-  
-  let keywords = [];
-  if (type === 'demand') keywords = ['作業', '計画', '需要', '日付'];
-  else if (type === 'supply') keywords = ['氏名', '名前', '区分', '実働'];
-  else if (type === 'skills') keywords = ['作業員名', '氏名', '名前', 'スキル', 'No'];
-  else keywords = ['日付'];
-
-  const headerRowIndex = findHeaderRowIndex(lines, keywords);
-
-  if (lines[headerRowIndex]) {
-    const headers = lines[headerRowIndex].split('\t').map(h => h.trim());
-    const data = [];
-    for (let i = headerRowIndex + 1; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      const values = lines[i].split('\t');
-      const obj = {};
-      let hasValue = false;
-      headers.forEach((header, index) => {
-        if (header) {
-          let val = values[index] ? values[index].trim() : '';
-          obj[header] = val;
-          if(val) hasValue = true;
-        }
-      });
-      if (hasValue) data.push(obj);
-    }
-    return { data, headers, headerRowIndex, rawLines };
-  }
-  return { data: [], headers: [], headerRowIndex: 0, rawLines };
-};
-
-const parseSkillData = (text) => {
-  const { data, rawLines } = parseTSV(text, 'skills');
-  const firstCol = rawLines.map(row => row[0]);
-  const hasKubun = firstCol.includes('区分');
-  const hasRank = firstCol.some(val => val && val.includes('順位'));
-  const workerNameRowIndex = rawLines.findIndex(row => row[0] && row[0].includes('作業員名'));
-
-  if (hasKubun && workerNameRowIndex !== -1) {
-    const workerNames = rawLines[workerNameRowIndex];
-    const kubunRow = rawLines.find(row => row[0] === '区分') || [];
-    const rankRow = rawLines.find(row => row[0] && row[0].includes('順位')) || [];
-    const excludeKeys = ['区分', '供給順位', '順位', '人工', '時間区分', '作業員名', '作業名', 'No'];
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>トップリバー 労働力需給ギャップ分析</title>
     
-    const skillRows = rawLines.filter(row => {
-      const key = row[0];
-      return key && !excludeKeys.some(k => key.includes(k));
-    });
-
-    const workers = [];
-    for (let col = 1; col < workerNames.length; col++) {
-      const name = workerNames[col];
-      if (!name) continue;
-      const category = kubunRow[col] || '';
-      let rank = parseInt(rankRow[col]);
-      if (isNaN(rank)) rank = 999;
-      
-      const pSkills = {};
-      skillRows.forEach(sRow => {
-        const skillName = sRow[0];
-        const val = sRow[col];
-        if (['1', '◯', '○', 'O', 'o', 'TRUE'].includes(val)) {
-          pSkills[skillName] = 1;
-        }
-      });
-      workers.push({ name: name, category: category, rank: rank, skills: pSkills });
-    }
-    return workers;
-  } else {
-    const workers = [];
-    data.forEach(row => {
-      const name = getValue(row, ['作業員名', '氏名', '名前']);
-      if (!name) return;
-      const pSkills = {};
-      Object.keys(row).forEach(key => {
-        const val = row[key];
-        if (['◯', '○', 'O', 'o', '1', 'TRUE', 'true'].includes(String(val))) {
-          pSkills[key] = 1;
-        }
-      });
-      const rankVal = getValue(row, ['供給順位', '優先順位', 'Rank']);
-      let rank = parseInt(rankVal);
-      if (isNaN(rank)) rank = 999;
-      const catVal = getValue(row, ['区分', '属性']);
-      workers.push({ name: name, rank: rank, category: catVal, skills: pSkills });
-    });
-    return workers;
-  }
-};
-
-const formatDate = (date) => {
-  const d = new Date(date);
-  if (isNaN(d.getTime())) return '';
-  const month = '' + (d.getMonth() + 1);
-  const day = '' + d.getDate();
-  const year = d.getFullYear();
-  return [year, month.padStart(2, '0'), day.padStart(2, '0')].join('-');
-};
-
-const getWeekNumber = (d) => {
-  d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
-  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay()||7));
-  const yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
-  return Math.ceil(( ( (d.getTime() - yearStart.getTime()) / 86400000) + 1)/7);
-};
-
-const calcHarvestCap = (row, totalHours) => {
-  const startVal = getValue(row, ['始業', '開始', '開始時間']);
-  const endVal = getValue(row, ['終業', '終了', '終了時間']);
-  
-  const parseTime = (val) => {
-    if (!val) return null;
-    if (typeof val === 'string' && val.includes(':')) {
-      const [h, m] = val.split(':').map(Number);
-      return h * 60 + m;
-    }
-    if (!isNaN(val)) return Math.round(Number(val) * 24 * 60);
-    return null;
-  };
-
-  const startMin = parseTime(startVal);
-  const endMin = parseTime(endVal);
-  if (startMin === null || endMin === null) return 0;
-
-  const winStart = 4 * 60; // 4:00
-  const winEnd = 12 * 60;  // 12:00
-  const overlapStart = Math.max(startMin, winStart);
-  const overlapEnd = Math.min(endMin, winEnd);
-  const overlap = Math.max(0, overlapEnd - overlapStart);
-  const overlapHours = overlap / 60.0;
-  
-  return Math.min(overlapHours, totalHours);
-};
-
-// --- デフォルトデータ ---
-const DEFAULT_DEMAND = `日付	作業	圃場名	作業時間
-2026/6/1	定植	御代田第1	30
-2026/6/1	収穫	富士見	15
-`;
-
-const DEFAULT_SUPPLY = `日付	氏名	区分	実働時間(h)	始業	終業
-2026/6/1	坂口 肇	社員	10	6:00	17:00
-`;
-
-const DEFAULT_SKILLS = `No	作業員名	人工	区分	時間区分	供給順位	備考	収穫	定植	防除	マルチ張り
-1	坂口 肇	1	社員	常勤	1		◯	◯	◯	◯
-`;
-
-export default function App() {
-  const [activeTab, setActiveTab] = useState('input');
-  const [previewTab, setPreviewTab] = useState('supply');
-  const [resultTab, setResultTab] = useState('matrix');
-
-  const [demandText, setDemandText] = useState(DEFAULT_DEMAND);
-  const [supplyText, setSupplyText] = useState(DEFAULT_SUPPLY);
-  const [skillsText, setSkillsText] = useState(DEFAULT_SKILLS);
-  
-  const [results, setResults] = useState([]);
-  const [calculated, setCalculated] = useState(false);
-  const [simInfo, setSimInfo] = useState({ demandPeriod: '', supplyPeriod: '', offsetMsg: '' });
-  const [diagnosis, setDiagnosis] = useState(null);
-  
-  const [aiAdvice, setAiAdvice] = useState('');
-  const [isAiLoading, setIsAiLoading] = useState(false);
-  
-  const [xlsxReady, setXlsxReady] = useState(false);
-  
-  const [fileStatus, setFileStatus] = useState({
-    demand: { fileName: '', loaded: false, message: '' },
-    supply: { fileName: '', loaded: false, message: '' },
-    skills: { fileName: '', loaded: false, message: '' }
-  });
-
-  const fileInputRefs = {
-    demand: useRef(null),
-    supply: useRef(null),
-    skills: useRef(null)
-  };
-
-  useEffect(() => {
-    const script = document.createElement('script');
-    script.src = "https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js";
-    script.async = true;
-    script.onload = () => setXlsxReady(true);
-    document.body.appendChild(script);
-    return () => document.body.removeChild(script);
-  }, []);
-
-  const handleFileSelect = (e, type) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    if (!xlsxReady) {
-      alert("システム準備中です。少々お待ちください。");
-      return;
-    }
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
     
-    setFileStatus(prev => ({ ...prev, [type]: { fileName: file.name, loaded: false, message: '読込中...' } }));
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-is@18/umd/react-is.production.min.js"></script>
     
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const data = new Uint8Array(e.target.result);
-        const workbook = window.XLSX.read(data, { type: 'array', cellDates: true });
-        
-        let targetSheetName = '';
-        const keywords = {
-          demand: ['作業', '計画', '需要', 'Demand'],
-          supply: ['シミュ', '月次', '供給', 'Supply'],
-          skills: ['人員', '能力', 'スキル', 'Skill']
+    <!-- Babel (ブラウザでのJSXコンパイル用) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Recharts とその依存ライブラリ (バージョンを安定版に固定) -->
+    <script src="https://unpkg.com/prop-types/prop-types.min.js"></script>
+    <script src="https://unpkg.com/recharts@2.1.12/umd/Recharts.js"></script>
+    
+    <!-- SheetJS (Excel読み込み用) -->
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+</head>
+<body class="bg-[#F8F9FA] text-gray-800 font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+        const { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip: RechartsTooltip, Legend, ResponsiveContainer } = window.Recharts;
+
+        // --- アイコンコンポーネント定義 (Lucide Reactの代替) ---
+        const Icon = ({ className, children }) => (
+            <svg className={className} xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{children}</svg>
+        );
+        const Calendar = ({className}) => <Icon className={className}><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></Icon>;
+        const Users = ({className}) => <Icon className={className}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></Icon>;
+        const Briefcase = ({className}) => <Icon className={className}><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></Icon>;
+        const BarChart3 = ({className}) => <Icon className={className}><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></Icon>;
+        const ArrowRight = ({className}) => <Icon className={className}><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></Icon>;
+        const ChevronRight = ({className}) => <Icon className={className}><polyline points="9 18 15 12 9 6"></polyline></Icon>;
+        const Upload = ({className}) => <Icon className={className}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></Icon>;
+        const CheckCircle2 = ({className}) => <Icon className={className}><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></Icon>;
+        const X = ({className}) => <Icon className={className}><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></Icon>;
+        const Sparkles = ({className}) => <Icon className={className}><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/></Icon>;
+        const Loader2 = ({className}) => <Icon className={className}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></Icon>;
+        const Download = ({className}) => <Icon className={className}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></Icon>;
+
+        // --- Gemini API Key ---
+        const apiKey = ""; // ※AI分析機能を使用する場合、ここにGemini APIキーを入力してください
+
+        // --- 1. 定数・設定定義 ---
+        const TASK_SKILL_MAP = {
+            '除草剤散布（ブーム）': '除草剤ブーム', '除草剤散布（手ざお）': '除草剤手ざお',
+            '草刈（定植後）': '草刈定植後', '草刈（定植前）': '草刈定植前',
+            '潅水（ブーム）': '潅水ブーム', '追肥': '追肥（次作用）',
+            '追肥（次作用）': '追肥（次作用）', '畝立て': '畝立て',
+            '中耕': '中耕', '耕耘': '耕耘', '施肥': '施肥',
+            'マルチ張り': 'マルチ張り', '定植': '定植', '収穫': '収穫',
+            '防除': '防除', 'マルチ掃除': 'マルチ掃除',
+            'マルチ剥ぎ': 'マルチ剥ぎ', '荒起こし': '荒起こし', '草取り': '草取り'
         };
-        const targetKeywords = keywords[type] || [];
-        targetSheetName = workbook.SheetNames.find(name => targetKeywords.some(keyword => name.includes(keyword)));
-        if (!targetSheetName) targetSheetName = workbook.SheetNames[0];
 
-        const worksheet = workbook.Sheets[targetSheetName];
-        const tsv = window.XLSX.utils.sheet_to_csv(worksheet, { FS: '\t', dateNF: 'yyyy/mm/dd' });
-        
-        if (!tsv.trim()) throw new Error("データが存在しません。");
-        
-        if (type === 'demand') setDemandText(tsv);
-        if (type === 'supply') setSupplyText(tsv);
-        if (type === 'skills') setSkillsText(tsv);
-        
-        setFileStatus(prev => ({ ...prev, [type]: { fileName: file.name, loaded: true, message: `完了 (シート: ${targetSheetName})` } }));
-        setActiveTab('preview');
-        setPreviewTab(type);
-      } catch (err) {
-        setFileStatus(prev => ({ ...prev, [type]: { fileName: file.name, loaded: false, message: '読込失敗' } }));
-      }
-    };
-    reader.readAsArrayBuffer(file);
-  };
+        const TASK_PRIORITIES = {
+            '収穫': 10, '定植': 20, 'マルチ張り': 30, '畝立て': 30, '耕耘': 30,
+            '施肥': 30, '中耕': 30, '防除': 40, '潅水（ブーム）': 40, '追肥': 40,
+            '追肥（次作用）': 40, '除草剤散布（ブーム）': 40, '除草剤散布（手ざお）': 40,
+            '草刈（定植前）': 40, '草刈（定植後）': 40, '草取り': 40, 'マルチ剥ぎ': 50,
+            '荒起こし': 50, 'マルチ掃除': 50
+        };
 
-  const clearFile = (type) => {
-    setFileStatus(prev => ({ ...prev, [type]: { fileName: '', loaded: false, message: '' } }));
-    if (fileInputRefs[type].current) fileInputRefs[type].current.value = '';
-  };
+        const DEFAULT_PRIORITY = 99;
 
-  const handleDownloadCSV = () => {
-    if (results.length === 0) return;
-    const csvHeaders = ['日付', '週', '作業', '圃場名', '需要(h)', '供給(h)', '不足(h)', '充足率(%)', '判定'];
-    const csvRows = results.map(r => {
-      const rate = r.demand > 0 ? (r.assigned / r.demand * 100).toFixed(1) : '100.0';
-      const status = r.gap > 0.01 ? '不足あり' : 'OK';
-      return [
-        r.date, `第${r.week}週`, r.task, r.location || '',
-        r.demand.toFixed(2), r.assigned.toFixed(2), r.gap.toFixed(2), rate, status
-      ].join(',');
-    });
-    
-    const csvContent = '\uFEFF' + [csvHeaders.join(','), ...csvRows].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `需給分析結果_${formatDate(new Date())}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
+        // --- 2. ヘルパー関数 ---
+        const normalizeName = (name) => {
+            if (!name) return "";
+            return String(name).replace(/[\s　]+/g, "").trim();
+        };
 
-  const handleAiAnalysis = async () => {
-    if (!results || results.length === 0) return;
-    setIsAiLoading(true);
-    setAiAdvice('');
+        const findHeaderRowIndex = (lines, keywords) => {
+            for (let i = 0; i < Math.min(lines.length, 30); i++) {
+                const line = lines[i];
+                if (keywords.some(k => line.includes(k))) return i;
+            }
+            return 0;
+        };
 
-    const weeklySummary = {};
-    const taskSummary = {};
-    let totalGap = 0;
-    
-    results.forEach(r => {
-      if (!weeklySummary[r.week]) weeklySummary[r.week] = 0;
-      weeklySummary[r.week] += r.gap > 0 ? r.gap : 0;
-      if (r.gap > 0) {
-        if (!taskSummary[r.task]) taskSummary[r.task] = 0;
-        taskSummary[r.task] += r.gap;
-        totalGap += r.gap;
-      }
-    });
+        const getValue = (row, keys) => {
+            if (!row) return undefined;
+            for (const key of keys) {
+                if (row[key] !== undefined && row[key] !== "") return row[key];
+            }
+            return undefined;
+        };
 
-    const topShortageWeeks = Object.entries(weeklySummary)
-      .sort(([, a], [, b]) => b - a)
-      .filter(([, gap]) => gap > 0)
-      .slice(0, 5)
-      .map(([week, gap]) => `第${week}週: ${gap.toFixed(1)}h`);
+        const parseTSV = (text, type) => {
+            const lines = text.trim().split('\n');
+            if (lines.length === 0) return { data: [], headers: [], headerRowIndex: 0, rawLines: [] };
 
-    const topShortageTasks = Object.entries(taskSummary)
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, 5)
-      .map(([task, gap]) => `${task}: ${gap.toFixed(1)}h`);
+            const rawLines = lines.map(line => line.split('\t').map(c => c.trim()));
+            let keywords = [];
+            if (type === 'demand') keywords = ['作業', '計画', '需要', '日付'];
+            else if (type === 'supply') keywords = ['氏名', '名前', '区分', '実働'];
+            else if (type === 'skills') keywords = ['作業員名', '氏名', '名前', 'スキル', 'No'];
+            else keywords = ['日付'];
 
-    const promptText = `
+            const headerRowIndex = findHeaderRowIndex(lines, keywords);
+
+            if (lines[headerRowIndex]) {
+                const headers = lines[headerRowIndex].split('\t').map(h => h.trim());
+                const data = [];
+                for (let i = headerRowIndex + 1; i < lines.length; i++) {
+                    const line = lines[i].trim();
+                    if (!line) continue;
+                    const values = lines[i].split('\t');
+                    const obj = {};
+                    let hasValue = false;
+                    headers.forEach((header, index) => {
+                        if (header) {
+                            let val = values[index] ? values[index].trim() : '';
+                            obj[header] = val;
+                            if(val) hasValue = true;
+                        }
+                    });
+                    if (hasValue) data.push(obj);
+                }
+                return { data, headers, headerRowIndex, rawLines };
+            }
+            return { data: [], headers: [], headerRowIndex: 0, rawLines };
+        };
+
+        const parseSkillData = (text) => {
+            const { data, rawLines } = parseTSV(text, 'skills');
+            const firstCol = rawLines.map(row => row[0]);
+            const hasKubun = firstCol.includes('区分');
+            const hasRank = firstCol.some(val => val && val.includes('順位'));
+            const workerNameRowIndex = rawLines.findIndex(row => row[0] && row[0].includes('作業員名'));
+
+            if (hasKubun && workerNameRowIndex !== -1) {
+                const workerNames = rawLines[workerNameRowIndex];
+                const kubunRow = rawLines.find(row => row[0] === '区分') || [];
+                const rankRow = rawLines.find(row => row[0] && row[0].includes('順位')) || [];
+                const excludeKeys = ['区分', '供給順位', '順位', '人工', '時間区分', '作業員名', '作業名', 'No'];
+                
+                const skillRows = rawLines.filter(row => {
+                    const key = row[0];
+                    return key && !excludeKeys.some(k => key.includes(k));
+                });
+
+                const workers = [];
+                for (let col = 1; col < workerNames.length; col++) {
+                    const name = workerNames[col];
+                    if (!name) continue;
+                    const category = kubunRow[col] || '';
+                    let rank = parseInt(rankRow[col]);
+                    if (isNaN(rank)) rank = 999;
+                    
+                    const pSkills = {};
+                    skillRows.forEach(sRow => {
+                        const skillName = sRow[0];
+                        const val = sRow[col];
+                        if (['1', '◯', '○', 'O', 'o', 'TRUE'].includes(val)) {
+                            pSkills[skillName] = 1;
+                        }
+                    });
+                    workers.push({ name: name, category: category, rank: rank, skills: pSkills });
+                }
+                return workers;
+            } else {
+                const workers = [];
+                data.forEach(row => {
+                    const name = getValue(row, ['作業員名', '氏名', '名前']);
+                    if (!name) return;
+                    const pSkills = {};
+                    Object.keys(row).forEach(key => {
+                        const val = row[key];
+                        if (['◯', '○', 'O', 'o', '1', 'TRUE', 'true'].includes(String(val))) {
+                            pSkills[key] = 1;
+                        }
+                    });
+                    const rankVal = getValue(row, ['供給順位', '優先順位', 'Rank']);
+                    let rank = parseInt(rankVal);
+                    if (isNaN(rank)) rank = 999;
+                    const catVal = getValue(row, ['区分', '属性']);
+                    workers.push({ name: name, rank: rank, category: catVal, skills: pSkills });
+                });
+                return workers;
+            }
+        };
+
+        const formatDate = (date) => {
+            const d = new Date(date);
+            if (isNaN(d.getTime())) return '';
+            const month = '' + (d.getMonth() + 1);
+            const day = '' + d.getDate();
+            const year = d.getFullYear();
+            return [year, month.padStart(2, '0'), day.padStart(2, '0')].join('-');
+        };
+
+        const getWeekNumber = (d) => {
+            d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+            d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay()||7));
+            const yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+            return Math.ceil(( ( (d.getTime() - yearStart.getTime()) / 86400000) + 1)/7);
+        };
+
+        const calcHarvestCap = (row, totalHours) => {
+            const startVal = getValue(row, ['始業', '開始', '開始時間']);
+            const endVal = getValue(row, ['終業', '終了', '終了時間']);
+            
+            const parseTime = (val) => {
+                if (!val) return null;
+                if (typeof val === 'string' && val.includes(':')) {
+                    const [h, m] = val.split(':').map(Number);
+                    return h * 60 + m;
+                }
+                if (!isNaN(val)) return Math.round(Number(val) * 24 * 60);
+                return null;
+            };
+
+            const startMin = parseTime(startVal);
+            const endMin = parseTime(endVal);
+            if (startMin === null || endMin === null) return 0;
+
+            const winStart = 4 * 60; // 4:00
+            const winEnd = 12 * 60;  // 12:00
+            const overlapStart = Math.max(startMin, winStart);
+            const overlapEnd = Math.min(endMin, winEnd);
+            const overlap = Math.max(0, overlapEnd - overlapStart);
+            const overlapHours = overlap / 60.0;
+            
+            return Math.min(overlapHours, totalHours);
+        };
+
+        // --- デフォルトデータ ---
+        const DEFAULT_DEMAND = `日付\t作業\t圃場名\t作業時間\n2026/6/1\t定植\t御代田第1\t30\n2026/6/1\t収穫\t富士見\t15\n`;
+        const DEFAULT_SUPPLY = `日付\t氏名\t区分\t実働時間(h)\t始業\t終業\n2026/6/1\t坂口 肇\t社員\t10\t6:00\t17:00\n`;
+        const DEFAULT_SKILLS = `No\t作業員名\t人工\t区分\t時間区分\t供給順位\t備考\t収穫\t定植\t防除\tマルチ張り\n1\t坂口 肇\t1\t社員\t常勤\t1\t\t◯\t◯\t◯\t◯\n`;
+
+        // --- メインアプリケーション ---
+        function App() {
+            const [activeTab, setActiveTab] = useState('input');
+            const [previewTab, setPreviewTab] = useState('supply');
+            const [resultTab, setResultTab] = useState('matrix');
+
+            const [demandText, setDemandText] = useState(DEFAULT_DEMAND);
+            const [supplyText, setSupplyText] = useState(DEFAULT_SUPPLY);
+            const [skillsText, setSkillsText] = useState(DEFAULT_SKILLS);
+            
+            const [results, setResults] = useState([]);
+            const [calculated, setCalculated] = useState(false);
+            const [simInfo, setSimInfo] = useState({ demandPeriod: '', supplyPeriod: '', offsetMsg: '' });
+            const [diagnosis, setDiagnosis] = useState(null);
+            
+            const [aiAdvice, setAiAdvice] = useState('');
+            const [isAiLoading, setIsAiLoading] = useState(false);
+            
+            // HTML版ではCDNからロード済みのため常にtrue
+            const [xlsxReady, setXlsxReady] = useState(true);
+            
+            const [fileStatus, setFileStatus] = useState({
+                demand: { fileName: '', loaded: false, message: '' },
+                supply: { fileName: '', loaded: false, message: '' },
+                skills: { fileName: '', loaded: false, message: '' }
+            });
+
+            const fileInputRefs = {
+                demand: useRef(null),
+                supply: useRef(null),
+                skills: useRef(null)
+            };
+
+            const handleFileSelect = (e, type) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                
+                setFileStatus(prev => ({ ...prev, [type]: { fileName: file.name, loaded: false, message: '読込中...' } }));
+                
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const data = new Uint8Array(e.target.result);
+                        const workbook = window.XLSX.read(data, { type: 'array', cellDates: true });
+                        
+                        let targetSheetName = '';
+                        const keywords = {
+                            demand: ['作業', '計画', '需要', 'Demand'],
+                            supply: ['シミュ', '月次', '供給', 'Supply'],
+                            skills: ['人員', '能力', 'スキル', 'Skill']
+                        };
+                        const targetKeywords = keywords[type] || [];
+                        targetSheetName = workbook.SheetNames.find(name => targetKeywords.some(keyword => name.includes(keyword)));
+                        if (!targetSheetName) targetSheetName = workbook.SheetNames[0];
+
+                        const worksheet = workbook.Sheets[targetSheetName];
+                        const tsv = window.XLSX.utils.sheet_to_csv(worksheet, { FS: '\t', dateNF: 'yyyy/mm/dd' });
+                        
+                        if (!tsv.trim()) throw new Error("データが存在しません。");
+                        
+                        if (type === 'demand') setDemandText(tsv);
+                        if (type === 'supply') setSupplyText(tsv);
+                        if (type === 'skills') setSkillsText(tsv);
+                        
+                        setFileStatus(prev => ({ ...prev, [type]: { fileName: file.name, loaded: true, message: `完了 (シート: ${targetSheetName})` } }));
+                        setActiveTab('preview');
+                        setPreviewTab(type);
+                    } catch (err) {
+                        setFileStatus(prev => ({ ...prev, [type]: { fileName: file.name, loaded: false, message: '読込失敗' } }));
+                    }
+                };
+                reader.readAsArrayBuffer(file);
+            };
+
+            const clearFile = (type) => {
+                setFileStatus(prev => ({ ...prev, [type]: { fileName: '', loaded: false, message: '' } }));
+                if (fileInputRefs[type].current) fileInputRefs[type].current.value = '';
+            };
+
+            const handleDownloadCSV = () => {
+                if (results.length === 0) return;
+                const csvHeaders = ['日付', '週', '作業', '圃場名', '需要(h)', '供給(h)', '不足(h)', '充足率(%)', '判定'];
+                const csvRows = results.map(r => {
+                    const rate = r.demand > 0 ? (r.assigned / r.demand * 100).toFixed(1) : '100.0';
+                    const status = r.gap > 0.01 ? '不足あり' : 'OK';
+                    return [
+                        r.date, `第${r.week}週`, r.task, r.location || '',
+                        r.demand.toFixed(2), r.assigned.toFixed(2), r.gap.toFixed(2), rate, status
+                    ].join(',');
+                });
+                
+                const csvContent = '\uFEFF' + [csvHeaders.join(','), ...csvRows].join('\n');
+                const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.setAttribute('download', `需給分析結果_${formatDate(new Date())}.csv`);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
+            const handleAiAnalysis = async () => {
+                if (!results || results.length === 0) return;
+                if (!apiKey) {
+                    alert("コード内の apiKey 変数にAPIキーが設定されていません。");
+                    return;
+                }
+                setIsAiLoading(true);
+                setAiAdvice('');
+
+                const weeklySummary = {};
+                const taskSummary = {};
+                let totalGap = 0;
+                
+                results.forEach(r => {
+                    if (!weeklySummary[r.week]) weeklySummary[r.week] = 0;
+                    weeklySummary[r.week] += r.gap > 0 ? r.gap : 0;
+                    if (r.gap > 0) {
+                        if (!taskSummary[r.task]) taskSummary[r.task] = 0;
+                        taskSummary[r.task] += r.gap;
+                        totalGap += r.gap;
+                    }
+                });
+
+                const topShortageWeeks = Object.entries(weeklySummary)
+                    .sort(([, a], [, b]) => b - a)
+                    .filter(([, gap]) => gap > 0)
+                    .slice(0, 5)
+                    .map(([week, gap]) => `第${week}週: ${gap.toFixed(1)}h`);
+
+                const topShortageTasks = Object.entries(taskSummary)
+                    .sort(([, a], [, b]) => b - a)
+                    .slice(0, 5)
+                    .map(([task, gap]) => `${task}: ${gap.toFixed(1)}h`);
+
+                const promptText = `
 あなたは有限会社トップリバーの営農部門を支援するプロフェッショナルコンサルタントです。
 以下の労働力需給ギャップ分析データに基づき、不足を解消するための実現可能な対策案を3つ提示してください。
 
@@ -374,584 +391,561 @@ export default function App() {
 - 文末は「である」「だ」調、または「です」「ます」調に統一すること。
 `;
 
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: promptText }] }] })
-        }
-      );
-      const data = await response.json();
-      const advice = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (advice) {
-        setAiAdvice(advice);
-      } else {
-        throw new Error('応答データが空です。');
-      }
-    } catch (error) {
-      console.error(error);
-      setAiAdvice("エラーが発生しました。通信状況を確認し、再度実行してください。");
-    } finally {
-      setIsAiLoading(false);
-    }
-  };
+                try {
+                    const response = await fetch(
+                        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`,
+                        {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ contents: [{ parts: [{ text: promptText }] }] })
+                        }
+                    );
+                    const data = await response.json();
+                    const advice = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                    if (advice) {
+                        setAiAdvice(advice);
+                    } else {
+                        throw new Error('応答データが空です。');
+                    }
+                } catch (error) {
+                    console.error(error);
+                    setAiAdvice("エラーが発生しました。通信状況やAPIキーを確認し、再度実行してください。");
+                } finally {
+                    setIsAiLoading(false);
+                }
+            };
 
-  const runSimulation = () => {
-    try {
-      const demandInfo = parseTSV(demandText, 'demand');
-      const supplyInfo = parseTSV(supplyText, 'supply');
-      const demandData = demandInfo.data;
-      const supplyData = supplyInfo.data;
+            const runSimulation = () => {
+                try {
+                    const demandInfo = parseTSV(demandText, 'demand');
+                    const supplyInfo = parseTSV(supplyText, 'supply');
+                    const demandData = demandInfo.data;
+                    const supplyData = supplyInfo.data;
 
-      if(demandData.length === 0) throw new Error("作業計画データが読み込めません。列名（『日付』『作業』等）を確認してください。");
-      if(supplyData.length === 0) throw new Error("供給データが読み込めません。列名（『氏名』『日付』等）を確認してください。");
+                    if(demandData.length === 0) throw new Error("作業計画データが読み込めません。列名（『日付』『作業』等）を確認してください。");
+                    if(supplyData.length === 0) throw new Error("供給データが読み込めません。列名（『氏名』『日付』等）を確認してください。");
 
-      const workersList = parseSkillData(skillsText);
-      const skillDb = {};
-      const skillDbNormalized = {};
-      
-      workersList.forEach(w => {
-        skillDb[w.name] = w;
-        skillDbNormalized[normalizeName(w.name)] = w;
-      });
-      const traineeTemplate = skillDb['実習生A'] || skillDbNormalized['実習生A'] || { rank: 999, skills: {} };
+                    const workersList = parseSkillData(skillsText);
+                    const skillDb = {};
+                    const skillDbNormalized = {};
+                    
+                    workersList.forEach(w => {
+                        skillDb[w.name] = w;
+                        skillDbNormalized[normalizeName(w.name)] = w;
+                    });
+                    const traineeTemplate = skillDb['実習生A'] || skillDbNormalized['実習生A'] || { rank: 999, skills: {} };
 
-      const supplyNames = new Set();
-      supplyData.forEach(r => {
-        const name = getValue(r, ['氏名', '名前', '作業員名']);
-        if(name) supplyNames.add(name);
-      });
+                    const supplyNames = new Set();
+                    supplyData.forEach(r => {
+                        const name = getValue(r, ['氏名', '名前', '作業員名']);
+                        if(name) supplyNames.add(name);
+                    });
 
-      const matchedNames = [];
-      const unmatchedNames = [];
-      supplyNames.forEach(name => {
-        if (skillDb[name] || skillDbNormalized[normalizeName(name)]) {
-          matchedNames.push(name);
-        } else {
-          const surname = String(name).split(/[\s　]+/)[0];
-          const normSurname = normalizeName(surname);
-          const row = supplyData.find(r => getValue(r, ['氏名', '名前', '作業員名']) === name);
-          const cat = getValue(row, ['区分', '属性']);
-          const isTrainee = cat && String(cat).includes('実習生');
-          
-          if (skillDb[surname] || skillDbNormalized[normSurname] || isTrainee) {
-            matchedNames.push(name + "(苗字/実習生)");
-          } else {
-            unmatchedNames.push(name);
-          }
-        }
-      });
+                    const matchedNames = [];
+                    const unmatchedNames = [];
+                    supplyNames.forEach(name => {
+                        if (skillDb[name] || skillDbNormalized[normalizeName(name)]) {
+                            matchedNames.push(name);
+                        } else {
+                            const surname = String(name).split(/[\s　]+/)[0];
+                            const normSurname = normalizeName(surname);
+                            const row = supplyData.find(r => getValue(r, ['氏名', '名前', '作業員名']) === name);
+                            const cat = getValue(row, ['区分', '属性']);
+                            const isTrainee = cat && String(cat).includes('実習生');
+                            
+                            if (skillDb[surname] || skillDbNormalized[normSurname] || isTrainee) {
+                                matchedNames.push(name + "(苗字/実習生)");
+                            } else {
+                                unmatchedNames.push(name);
+                            }
+                        }
+                    });
 
-      setDiagnosis({
-        totalWorkers: supplyNames.size,
-        matchedCount: matchedNames.length,
-        unmatchedCount: unmatchedNames.length,
-        unmatchedList: unmatchedNames.slice(0, 10)
-      });
+                    setDiagnosis({
+                        totalWorkers: supplyNames.size,
+                        matchedCount: matchedNames.length,
+                        unmatchedCount: unmatchedNames.length,
+                        unmatchedList: unmatchedNames.slice(0, 10)
+                    });
 
-      let demandStartYear = new Date().getFullYear();
-      const validDemandDates = demandData.map(r => new Date(getValue(r, ['日付', '年月日']))).filter(d => !isNaN(d.getTime()));
-      if (validDemandDates.length > 0) {
-        demandStartYear = new Date(Math.min(...validDemandDates)).getFullYear();
-      }
+                    let demandStartYear = new Date().getFullYear();
+                    const validDemandDates = demandData.map(r => new Date(getValue(r, ['日付', '年月日']))).filter(d => !isNaN(d.getTime()));
+                    if (validDemandDates.length > 0) {
+                        demandStartYear = new Date(Math.min(...validDemandDates)).getFullYear();
+                    }
 
-      let supplyStartYear = null;
-      for (const row of supplyData) {
-        const d = new Date(getValue(row, ['日付', '年月日']));
-        if (!isNaN(d.getTime())) {
-          supplyStartYear = d.getFullYear();
-          break;
-        }
-      }
-      
-      let yearOffset = supplyStartYear !== null ? demandStartYear - supplyStartYear : 0;
+                    let supplyStartYear = null;
+                    for (const row of supplyData) {
+                        const d = new Date(getValue(row, ['日付', '年月日']));
+                        if (!isNaN(d.getTime())) {
+                            supplyStartYear = d.getFullYear();
+                            break;
+                        }
+                    }
+                    
+                    let yearOffset = supplyStartYear !== null ? demandStartYear - supplyStartYear : 0;
 
-      const groupedSupply = {};
-      let minSDate = null, maxSDate = null;
-      supplyData.forEach(row => {
-        let date = new Date(getValue(row, ['日付', '年月日']));
-        if (isNaN(date.getTime())) return;
-        if (yearOffset !== 0) date.setFullYear(date.getFullYear() + yearOffset);
-        
-        const dateStr = formatDate(date);
-        if (!groupedSupply[dateStr]) groupedSupply[dateStr] = [];
-        groupedSupply[dateStr].push(row);
-        
-        if(!minSDate || date < minSDate) minSDate = date;
-        if(!maxSDate || date > maxSDate) maxSDate = date;
-      });
+                    const groupedSupply = {};
+                    let minSDate = null, maxSDate = null;
+                    supplyData.forEach(row => {
+                        let date = new Date(getValue(row, ['日付', '年月日']));
+                        if (isNaN(date.getTime())) return;
+                        if (yearOffset !== 0) date.setFullYear(date.getFullYear() + yearOffset);
+                        
+                        const dateStr = formatDate(date);
+                        if (!groupedSupply[dateStr]) groupedSupply[dateStr] = [];
+                        groupedSupply[dateStr].push(row);
+                        
+                        if(!minSDate || date < minSDate) minSDate = date;
+                        if(!maxSDate || date > maxSDate) maxSDate = date;
+                    });
 
-      const groupedDemand = {};
-      const uniqueDates = [];
-      let minDDate = null, maxDDate = null;
-      demandData.forEach(row => {
-        const date = new Date(getValue(row, ['日付', '年月日']));
-        if (isNaN(date.getTime())) return;
-        
-        const dateStr = formatDate(date);
-        if (!groupedDemand[dateStr]) {
-          groupedDemand[dateStr] = [];
-          uniqueDates.push(dateStr);
-        }
-        
-        const taskName = getValue(row, ['作業', '作業名', '品目']);
-        row._taskName = taskName;
-        row._priority = TASK_PRIORITIES[taskName] || DEFAULT_PRIORITY;
-        groupedDemand[dateStr].push(row);
-        
-        if(!minDDate || date < minDDate) minDDate = date;
-        if(!maxDDate || date > maxDDate) maxDDate = date;
-      });
+                    const groupedDemand = {};
+                    const uniqueDates = [];
+                    let minDDate = null, maxDDate = null;
+                    demandData.forEach(row => {
+                        const date = new Date(getValue(row, ['日付', '年月日']));
+                        if (isNaN(date.getTime())) return;
+                        
+                        const dateStr = formatDate(date);
+                        if (!groupedDemand[dateStr]) {
+                            groupedDemand[dateStr] = [];
+                            uniqueDates.push(dateStr);
+                        }
+                        
+                        const taskName = getValue(row, ['作業', '作業名', '品目']);
+                        row._taskName = taskName;
+                        row._priority = TASK_PRIORITIES[taskName] || DEFAULT_PRIORITY;
+                        groupedDemand[dateStr].push(row);
+                        
+                        if(!minDDate || date < minDDate) minDDate = date;
+                        if(!maxDDate || date > maxDDate) maxDDate = date;
+                    });
 
-      uniqueDates.sort();
-      
-      setSimInfo({
-        demandPeriod: minDDate ? `${formatDate(minDDate)} 〜 ${formatDate(maxDDate)}` : '-',
-        supplyPeriod: minSDate ? `${formatDate(minSDate)} 〜 ${formatDate(maxSDate)}` : '-',
-        offsetMsg: yearOffset !== 0 ? `(年補正: ${yearOffset}年)` : ''
-      });
+                    uniqueDates.sort();
+                    
+                    setSimInfo({
+                        demandPeriod: minDDate ? `${formatDate(minDDate)} 〜 ${formatDate(maxDDate)}` : '-',
+                        supplyPeriod: minSDate ? `${formatDate(minSDate)} 〜 ${formatDate(maxSDate)}` : '-',
+                        offsetMsg: yearOffset !== 0 ? `(年補正: ${yearOffset}年)` : ''
+                    });
 
-      const simResults = [];
-      uniqueDates.forEach(dateStr => {
-        const dayDemand = groupedDemand[dateStr];
-        dayDemand.sort((a, b) => a._priority - b._priority);
-        const daySupply = groupedSupply[dateStr] || [];
-        
-        let workers = [];
-        daySupply.forEach((row, idx) => {
-          const name = getValue(row, ['氏名', '名前', '作業員名']);
-          const category = getValue(row, ['区分', '属性']);
-          const hoursVal = getValue(row, ['実働時間(h)', '実働時間', '勤務時間']);
-          const totalHours = parseFloat(hoursVal || 0);
-          
-          if (totalHours <= 0) return;
-          
-          let info = { rank: 9999, skills: {} };
-          if (skillDb[name]) info = skillDb[name];
-          else if (skillDbNormalized[normalizeName(name)]) info = skillDbNormalized[normalizeName(name)];
-          else {
-            const surname = String(name).split(/[\s　]+/)[0];
-            const normSurname = normalizeName(surname);
-            if (skillDb[surname]) info = skillDb[surname];
-            else if (skillDbNormalized[normSurname]) info = skillDbNormalized[normSurname];
-            else if (category && String(category).includes('実習生')) info = traineeTemplate;
-          }
-          
-          const hCap = calcHarvestCap(row, totalHours);
-          workers.push({
-            id: idx, name: name, rank: info.rank, skills: info.skills,
-            totalCap: totalHours, harvestCap: hCap
-          });
-        });
-        
-        workers.sort((a, b) => a.rank - b.rank);
-        
-        dayDemand.forEach(taskRow => {
-          const taskName = taskRow._taskName;
-          const timeVal = getValue(taskRow, ['作業時間', '時間', '工数']);
-          let hoursNeeded = parseFloat(timeVal || 0);
-          const skillNeeded = TASK_SKILL_MAP[taskName] || taskName;
-          const location = getValue(taskRow, ['圃場', '圃場名', '畑', '場所', '生産圃場']) || '-';
-          let hoursAssigned = 0;
-          const initialNeeded = hoursNeeded;
-          
-          for (const w of workers) {
-            if (hoursNeeded <= 0.01) break;
-            if (w.totalCap <= 0.01) continue;
-            
-            let canDo = false;
-            if (w.skills && (w.skills[skillNeeded] === 1 || w.skills[taskName] === 1)) {
-              canDo = true;
-            }
-            
-            if (canDo) {
-              let available = w.totalCap;
-              if (skillNeeded === '収穫') available = Math.min(available, w.harvestCap);
-              
-              const allocate = Math.min(available, hoursNeeded);
-              if (allocate > 0) {
-                w.totalCap -= allocate;
-                if (skillNeeded === '収穫') w.harvestCap -= allocate;
-                else w.harvestCap = Math.min(w.harvestCap, w.totalCap);
+                    const simResults = [];
+                    uniqueDates.forEach(dateStr => {
+                        const dayDemand = groupedDemand[dateStr];
+                        dayDemand.sort((a, b) => a._priority - b._priority);
+                        const daySupply = groupedSupply[dateStr] || [];
+                        
+                        let workers = [];
+                        daySupply.forEach((row, idx) => {
+                            const name = getValue(row, ['氏名', '名前', '作業員名']);
+                            const category = getValue(row, ['区分', '属性']);
+                            const hoursVal = getValue(row, ['実働時間(h)', '実働時間', '勤務時間']);
+                            const totalHours = parseFloat(hoursVal || 0);
+                            
+                            if (totalHours <= 0) return;
+                            
+                            let info = { rank: 9999, skills: {} };
+                            if (skillDb[name]) info = skillDb[name];
+                            else if (skillDbNormalized[normalizeName(name)]) info = skillDbNormalized[normalizeName(name)];
+                            else {
+                                const surname = String(name).split(/[\s　]+/)[0];
+                                const normSurname = normalizeName(surname);
+                                if (skillDb[surname]) info = skillDb[surname];
+                                else if (skillDbNormalized[normSurname]) info = skillDbNormalized[normSurname];
+                                else if (category && String(category).includes('実習生')) info = traineeTemplate;
+                            }
+                            
+                            const hCap = calcHarvestCap(row, totalHours);
+                            workers.push({
+                                id: idx, name: name, rank: info.rank, skills: info.skills,
+                                totalCap: totalHours, harvestCap: hCap
+                            });
+                        });
+                        
+                        workers.sort((a, b) => a.rank - b.rank);
+                        
+                        dayDemand.forEach(taskRow => {
+                            const taskName = taskRow._taskName;
+                            const timeVal = getValue(taskRow, ['作業時間', '時間', '工数']);
+                            let hoursNeeded = parseFloat(timeVal || 0);
+                            const skillNeeded = TASK_SKILL_MAP[taskName] || taskName;
+                            const location = getValue(taskRow, ['圃場', '圃場名', '畑', '場所', '生産圃場']) || '-';
+                            let hoursAssigned = 0;
+                            const initialNeeded = hoursNeeded;
+                            
+                            for (const w of workers) {
+                                if (hoursNeeded <= 0.01) break;
+                                if (w.totalCap <= 0.01) continue;
+                                
+                                let canDo = false;
+                                if (w.skills && (w.skills[skillNeeded] === 1 || w.skills[taskName] === 1)) {
+                                    canDo = true;
+                                }
+                                
+                                if (canDo) {
+                                    let available = w.totalCap;
+                                    if (skillNeeded === '収穫') available = Math.min(available, w.harvestCap);
+                                    
+                                    const allocate = Math.min(available, hoursNeeded);
+                                    if (allocate > 0) {
+                                        w.totalCap -= allocate;
+                                        if (skillNeeded === '収穫') w.harvestCap -= allocate;
+                                        else w.harvestCap = Math.min(w.harvestCap, w.totalCap);
+                                        
+                                        hoursNeeded -= allocate;
+                                        hoursAssigned += allocate;
+                                    }
+                                }
+                            }
+                            
+                            simResults.push({
+                                date: dateStr, week: getWeekNumber(new Date(dateStr)), task: taskName,
+                                priority: taskRow._priority, demand: initialNeeded, assigned: hoursAssigned,
+                                gap: initialNeeded - hoursAssigned, location: location
+                            });
+                        });
+                    });
+
+                    setResults(simResults);
+                    setCalculated(true);
+                    setActiveTab('result');
+                } catch (e) {
+                    alert("エラー: " + e.message);
+                }
+            };
+
+            const DataPreviewTable = ({ data, headers, rawLines }) => {
+                if (rawLines && rawLines.length > 0 && headers.length === 0) {
+                    return (
+                        <div className="overflow-x-auto border border-[#D9D9D9]">
+                            <table className="min-w-full text-sm text-left">
+                                <tbody>
+                                    {rawLines.slice(0, 15).map((row, i) => (
+                                        <tr key={i} className="border-b border-[#D9D9D9] hover:bg-gray-50">
+                                            {row.map((cell, j) => (
+                                                <td key={j} className="p-2 border-r border-[#D9D9D9] whitespace-nowrap">{cell}</td>
+                                            ))}
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                            <div className="p-2 text-xs text-gray-500 bg-gray-50 border-t border-[#D9D9D9]">※ 生データの一部を表示しています。</div>
+                        </div>
+                    );
+                }
+                if (!data || data.length === 0) return <div className="p-4 text-gray-500 border border-[#D9D9D9] bg-gray-50 text-center">データが存在しません</div>;
                 
-                hoursNeeded -= allocate;
-                hoursAssigned += allocate;
-              }
-            }
-          }
-          
-          simResults.push({
-            date: dateStr, week: getWeekNumber(new Date(dateStr)), task: taskName,
-            priority: taskRow._priority, demand: initialNeeded, assigned: hoursAssigned,
-            gap: initialNeeded - hoursAssigned, location: location
-          });
-        });
-      });
+                return (
+                    <div className="overflow-x-auto border border-[#D9D9D9]">
+                        <table className="min-w-full text-sm text-left">
+                            <thead className="bg-[#223e76] text-white">
+                                <tr>
+                                    {headers.map((h, i) => <th key={i} className="p-2 border-r border-[#D9D9D9] whitespace-nowrap">{h}</th>)}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {data.slice(0, 15).map((row, i) => (
+                                    <tr key={i} className="border-b border-[#D9D9D9] hover:bg-gray-50">
+                                        {headers.map((h, j) => (
+                                            <td key={j} className="p-2 border-r border-[#D9D9D9] whitespace-nowrap">{row[h]}</td>
+                                        ))}
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                        <div className="p-2 text-xs text-gray-500 bg-gray-50 border-t border-[#D9D9D9]">※ 先頭15件を表示しています。</div>
+                    </div>
+                );
+            };
 
-      setResults(simResults);
-      setCalculated(true);
-      setActiveTab('result');
-    } catch (e) {
-      alert("エラー: " + e.message);
-    }
-  };
+            const MatrixView = () => {
+                if (results.length === 0) return <div>データがありません</div>;
+                const tasks = [...new Set(results.map(r => r.task))].sort();
+                const weeks = [...new Set(results.map(r => r.week))].sort((a,b)=>a-b);
+                const matrix = {};
+                results.forEach(r => {
+                    if (!matrix[r.week]) matrix[r.week] = {};
+                    if (!matrix[r.week][r.task]) matrix[r.week][r.task] = 0;
+                    matrix[r.week][r.task] += r.gap;
+                });
 
-  const DataPreviewTable = ({ data, headers, rawLines }) => {
-    if (rawLines && rawLines.length > 0 && headers.length === 0) {
-      return (
-        <div className="overflow-x-auto border border-[#D9D9D9]">
-          <table className="min-w-full text-sm text-left">
-            <tbody>
-              {rawLines.slice(0, 15).map((row, i) => (
-                <tr key={i} className="border-b border-[#D9D9D9] hover:bg-gray-50">
-                  {row.map((cell, j) => (
-                    <td key={j} className="p-2 border-r border-[#D9D9D9] whitespace-nowrap">{cell}</td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <div className="p-2 text-xs text-gray-500 bg-gray-50 border-t border-[#D9D9D9]">※ 生データの一部を表示しています。</div>
-        </div>
-      );
-    }
-    if (!data || data.length === 0) return <div className="p-4 text-gray-500 border border-[#D9D9D9] bg-gray-50 text-center">データが存在しません</div>;
-    
-    return (
-      <div className="overflow-x-auto border border-[#D9D9D9]">
-        <table className="min-w-full text-sm text-left">
-          <thead className="bg-[#223e76] text-white">
-            <tr>
-              {headers.map((h, i) => <th key={i} className="p-2 border-r border-[#D9D9D9] whitespace-nowrap">{h}</th>)}
-            </tr>
-          </thead>
-          <tbody>
-            {data.slice(0, 15).map((row, i) => (
-              <tr key={i} className="border-b border-[#D9D9D9] hover:bg-gray-50">
-                {headers.map((h, j) => (
-                  <td key={j} className="p-2 border-r border-[#D9D9D9] whitespace-nowrap">{row[h]}</td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <div className="p-2 text-xs text-gray-500 bg-gray-50 border-t border-[#D9D9D9]">※ 先頭15件を表示しています。</div>
-      </div>
-    );
-  };
+                return (
+                    <div className="overflow-x-auto border border-[#D9D9D9]">
+                        <table className="min-w-full text-sm text-center">
+                            <thead className="bg-[#223e76] text-white">
+                                <tr>
+                                    <th className="p-2 border-r border-[#D9D9D9]">週 No.</th>
+                                    {tasks.map(t => <th key={t} className="p-2 border-r border-[#D9D9D9] min-w-[80px]">{t}</th>)}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {weeks.map(w => (
+                                    <tr key={w} className="border-b border-[#D9D9D9]">
+                                        <td className="p-2 border-r border-[#D9D9D9] bg-gray-50 font-medium">第{w}週</td>
+                                        {tasks.map(t => {
+                                            const val = matrix[w]?.[t] || 0;
+                                            const isGap = val > 0.1;
+                                            return (
+                                                <td key={t} className={`p-2 border-r border-[#D9D9D9] ${isGap ? 'bg-red-50 text-red-700 font-bold' : 'text-gray-400'}`}>
+                                                    {val > 0 ? val.toFixed(1) : '-'}
+                                                </td>
+                                            );
+                                        })}
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                );
+            };
 
-  const MatrixView = () => {
-    if (results.length === 0) return <div>データがありません</div>;
-    const tasks = [...new Set(results.map(r => r.task))].sort();
-    const weeks = [...new Set(results.map(r => r.week))].sort((a,b)=>a-b);
-    const matrix = {};
-    results.forEach(r => {
-      if (!matrix[r.week]) matrix[r.week] = {};
-      if (!matrix[r.week][r.task]) matrix[r.week][r.task] = 0;
-      matrix[r.week][r.task] += r.gap;
-    });
-
-    return (
-      <div className="overflow-x-auto border border-[#D9D9D9]">
-        <table className="min-w-full text-sm text-center">
-          <thead className="bg-[#223e76] text-white">
-            <tr>
-              <th className="p-2 border-r border-[#D9D9D9]">週 No.</th>
-              {tasks.map(t => <th key={t} className="p-2 border-r border-[#D9D9D9] min-w-[80px]">{t}</th>)}
-            </tr>
-          </thead>
-          <tbody>
-            {weeks.map(w => (
-              <tr key={w} className="border-b border-[#D9D9D9]">
-                <td className="p-2 border-r border-[#D9D9D9] bg-gray-50 font-medium">第{w}週</td>
-                {tasks.map(t => {
-                  const val = matrix[w]?.[t] || 0;
-                  const isGap = val > 0.1;
-                  return (
-                    <td key={t} className={`p-2 border-r border-[#D9D9D9] ${isGap ? 'bg-red-50 text-red-700 font-bold' : 'text-gray-400'}`}>
-                      {val > 0 ? val.toFixed(1) : '-'}
-                    </td>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    );
-  };
-
-  const DailyView = () => (
-    <div className="overflow-x-auto border border-[#D9D9D9]">
-      <table className="min-w-full text-sm text-left">
-        <thead className="bg-[#223e76] text-white">
-          <tr>
-            <th className="p-2 border-r border-[#D9D9D9]">日付</th>
-            <th className="p-2 border-r border-[#D9D9D9]">週</th>
-            <th className="p-2 border-r border-[#D9D9D9]">作業</th>
-            <th className="p-2 border-r border-[#D9D9D9]">圃場名</th>
-            <th className="p-2 border-r border-[#D9D9D9] text-right">需要(h)</th>
-            <th className="p-2 border-r border-[#D9D9D9] text-right">割当(h)</th>
-            <th className="p-2 border-r border-[#D9D9D9] text-right">不足(h)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {results.map((r, i) => (
-            <tr key={i} className={`border-b border-[#D9D9D9] ${r.gap > 0 ? "bg-red-50" : "hover:bg-gray-50"}`}>
-              <td className="p-2 border-r border-[#D9D9D9]">{r.date}</td>
-              <td className="p-2 border-r border-[#D9D9D9]">第{r.week}週</td>
-              <td className="p-2 border-r border-[#D9D9D9]">{r.task}</td>
-              <td className="p-2 border-r border-[#D9D9D9]">{r.location}</td>
-              <td className="p-2 border-r border-[#D9D9D9] text-right">{r.demand.toFixed(1)}</td>
-              <td className="p-2 border-r border-[#D9D9D9] text-right">{r.assigned.toFixed(1)}</td>
-              <td className={`p-2 border-r border-[#D9D9D9] text-right font-medium ${r.gap > 0 ? 'text-red-700' : 'text-gray-500'}`}>
-                {r.gap > 0 ? r.gap.toFixed(1) : 'OK'}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-
-  const WeeklyChart = () => {
-    const summary = useMemo(() => {
-      const sum = {};
-      results.forEach(r => {
-        if (!sum[r.week]) sum[r.week] = { week: `第${r.week}週`, demand: 0, assigned: 0, gap: 0 };
-        sum[r.week].demand += r.demand;
-        sum[r.week].assigned += r.assigned;
-        sum[r.week].gap += r.gap;
-      });
-      return Object.values(sum).sort((a,b) => parseInt(a.week.replace(/\D/g,'')) - parseInt(b.week.replace(/\D/g,'')));
-    }, [results]);
-
-    return (
-      <div className="h-[400px] w-full mt-4">
-        <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={summary} margin={{ top: 20, right: 30, left: 20, bottom: 5 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#D9D9D9" />
-            <XAxis dataKey="week" stroke="#555" />
-            <YAxis stroke="#555" />
-            <RechartsTooltip />
-            <Legend />
-            <Bar dataKey="demand" name="需要(h)" fill="#223e76" />
-            <Bar dataKey="assigned" name="供給可能(h)" fill="#4A7C59" />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-    );
-  };
-
-  const FileUploadCard = ({ type, title, icon: Icon }) => {
-    const status = fileStatus[type];
-    return (
-      <div className="border border-[#D9D9D9] p-4 bg-white flex flex-col gap-3">
-        <div className="flex items-center gap-2 font-medium text-[#223e76]">
-          <Icon className="w-5 h-5" />
-          <h3>{title}</h3>
-        </div>
-        <div className="text-sm">
-          {status.loaded ? (
-            <div className="flex items-center justify-between bg-[#F8F9FA] p-2 border border-[#D9D9D9]">
-              <div className="flex items-center gap-2 text-green-700">
-                <CheckCircle2 className="w-4 h-4" />
-                <span className="truncate max-w-[180px]" title={status.fileName}>{status.fileName}</span>
-              </div>
-              <button onClick={() => clearFile(type)} className="text-gray-500 hover:text-red-600"><X className="w-4 h-4"/></button>
-            </div>
-          ) : (
-            <div className="bg-gray-50 p-2 border border-[#D9D9D9] border-dashed text-gray-500 text-center">ファイル未選択</div>
-          )}
-        </div>
-        {!status.loaded ? (
-          <label className={`flex items-center justify-center gap-2 px-3 py-2 border border-[#D9D9D9] bg-white hover:bg-gray-50 cursor-pointer text-sm font-medium transition-colors ${!xlsxReady ? 'opacity-50 cursor-not-allowed' : ''}`}>
-            <Upload className="w-4 h-4" />
-            <span>Excelを選択</span>
-            <input type="file" accept=".xlsx, .xls" className="hidden" onChange={(e) => handleFileSelect(e, type)} ref={fileInputRefs[type]} disabled={!xlsxReady} />
-          </label>
-        ) : (
-          <div className="text-xs text-gray-500 text-center mt-1">{status.message}</div>
-        )}
-      </div>
-    );
-  };
-
-  const getParsedPreviewData = () => {
-    let tsv = '';
-    if (previewTab === 'demand') tsv = demandText;
-    if (previewTab === 'supply') tsv = supplyText;
-    if (previewTab === 'skills') tsv = skillsText;
-    return parseTSV(tsv, previewTab);
-  };
-
-  const parsedData = getParsedPreviewData();
-
-  return (
-    <div className="min-h-screen bg-[#F8F9FA] p-4 font-sans text-gray-800">
-      <div className="max-w-6xl mx-auto bg-white border border-[#D9D9D9] shadow-sm">
-        
-        {/* Header */}
-        <header className="bg-[#223e76] text-white p-4 flex items-center gap-3">
-          <BarChart3 className="w-6 h-6" />
-          <h1 className="text-xl font-bold tracking-wider">トップリバー 労働力需給ギャップ分析</h1>
-          <span className="ml-auto text-sm border border-white/30 px-2 py-1 bg-white/10">Ver 2.1</span>
-        </header>
-
-        {/* Navigation */}
-        <div className="flex border-b border-[#D9D9D9] bg-white">
-          <button 
-            onClick={() => setActiveTab('input')} 
-            className={`flex-1 py-3 px-4 text-center font-bold text-sm transition-colors ${activeTab === 'input' ? 'bg-white text-[#223e76] border-b-4 border-[#223e76]' : 'text-gray-500 hover:bg-gray-50'}`}
-          >
-            1. ファイル読込
-          </button>
-          <button 
-            onClick={() => setActiveTab('preview')} 
-            className={`flex-1 py-3 px-4 text-center font-bold text-sm transition-colors ${activeTab === 'preview' ? 'bg-white text-[#223e76] border-b-4 border-[#223e76]' : 'text-gray-500 hover:bg-gray-50'}`}
-          >
-            2. データ確認
-          </button>
-          <button 
-            onClick={() => { if(!calculated) runSimulation(); else setActiveTab('result'); }} 
-            className={`flex-1 py-3 px-4 text-center font-bold text-sm transition-colors ${activeTab === 'result' ? 'bg-white text-[#223e76] border-b-4 border-[#223e76]' : 'text-gray-500 hover:bg-gray-50'}`}
-          >
-            3. 分析結果
-          </button>
-        </div>
-
-        {/* Content Area */}
-        <div className="p-6">
-          
-          {/* STEP 1: INPUT */}
-          {activeTab === 'input' && (
-            <div className="space-y-6">
-              <h2 className="text-lg font-bold text-[#223e76] border-l-4 border-[#223e76] pl-3">対象ファイルの選択</h2>
-              <p className="text-sm text-gray-600">各データのExcelファイルを読み込んでください。ファイルを選択すると自動的にデータを解析します。</p>
-              
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <FileUploadCard type="demand" title="1. 作業計画 (需要)" icon={Calendar} />
-                <FileUploadCard type="supply" title="2. 月次シミュ (供給)" icon={Users} />
-                <FileUploadCard type="skills" title="3. 人員能力表 (スキル)" icon={Briefcase} />
-              </div>
-              
-              <div className="flex justify-center mt-8">
-                <button 
-                  onClick={() => setActiveTab('preview')}
-                  className="bg-[#223e76] hover:bg-[#1a2f59] text-white px-8 py-3 font-bold flex items-center gap-2 transition-colors"
-                >
-                  データの中身を確認する <ChevronRight className="w-5 h-5" />
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* STEP 2: PREVIEW */}
-          {activeTab === 'preview' && (
-            <div className="space-y-6">
-              <div className="flex items-center justify-between">
-                <h2 className="text-lg font-bold text-[#223e76] border-l-4 border-[#223e76] pl-3">読み込みデータの確認</h2>
-                <button 
-                  onClick={runSimulation}
-                  className="bg-[#223e76] hover:bg-[#1a2f59] text-white px-6 py-2 font-bold flex items-center gap-2 transition-colors"
-                >
-                  計算実行 <ArrowRight className="w-5 h-5" />
-                </button>
-              </div>
-              
-              <p className="text-sm text-gray-600">システムが解析したデータ内容です。列名（ヘッダー）が正しく認識されているか確認してください。</p>
-              
-              <div className="border border-[#D9D9D9] bg-white">
-                <div className="flex border-b border-[#D9D9D9]">
-                  {[
-                    {id: 'demand', label: '作業計画', icon: Calendar},
-                    {id: 'supply', label: '月次シミュ', icon: Users},
-                    {id: 'skills', label: '人員能力表', icon: Briefcase}
-                  ].map(tab => (
-                    <button
-                      key={tab.id}
-                      onClick={() => setPreviewTab(tab.id)}
-                      className={`flex-1 py-2 px-4 flex items-center justify-center gap-2 text-sm font-bold ${previewTab === tab.id ? 'bg-[#223e76] text-white' : 'text-gray-500 hover:bg-gray-50'}`}
-                    >
-                      <tab.icon className="w-4 h-4" /> {tab.label}
-                    </button>
-                  ))}
+            const DailyView = () => (
+                <div className="overflow-x-auto border border-[#D9D9D9]">
+                    <table className="min-w-full text-sm text-left">
+                        <thead className="bg-[#223e76] text-white">
+                            <tr>
+                                <th className="p-2 border-r border-[#D9D9D9]">日付</th>
+                                <th className="p-2 border-r border-[#D9D9D9]">週</th>
+                                <th className="p-2 border-r border-[#D9D9D9]">作業</th>
+                                <th className="p-2 border-r border-[#D9D9D9]">圃場名</th>
+                                <th className="p-2 border-r border-[#D9D9D9] text-right">需要(h)</th>
+                                <th className="p-2 border-r border-[#D9D9D9] text-right">割当(h)</th>
+                                <th className="p-2 border-r border-[#D9D9D9] text-right">不足(h)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {results.map((r, i) => (
+                                <tr key={i} className={`border-b border-[#D9D9D9] ${r.gap > 0 ? "bg-red-50" : "hover:bg-gray-50"}`}>
+                                    <td className="p-2 border-r border-[#D9D9D9]">{r.date}</td>
+                                    <td className="p-2 border-r border-[#D9D9D9]">第{r.week}週</td>
+                                    <td className="p-2 border-r border-[#D9D9D9]">{r.task}</td>
+                                    <td className="p-2 border-r border-[#D9D9D9]">{r.location}</td>
+                                    <td className="p-2 border-r border-[#D9D9D9] text-right">{r.demand.toFixed(1)}</td>
+                                    <td className="p-2 border-r border-[#D9D9D9] text-right">{r.assigned.toFixed(1)}</td>
+                                    <td className={`p-2 border-r border-[#D9D9D9] text-right font-medium ${r.gap > 0 ? 'text-red-700' : 'text-gray-500'}`}>
+                                        {r.gap > 0 ? r.gap.toFixed(1) : 'OK'}
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
                 </div>
-                <div className="p-4 bg-white">
-                  <DataPreviewTable data={parsedData.data} headers={parsedData.headers} rawLines={parsedData.rawLines} />
+            );
+
+            const WeeklyChart = () => {
+                const summary = useMemo(() => {
+                    const sum = {};
+                    results.forEach(r => {
+                        if (!sum[r.week]) sum[r.week] = { week: `第${r.week}週`, demand: 0, assigned: 0, gap: 0 };
+                        sum[r.week].demand += r.demand;
+                        sum[r.week].assigned += r.assigned;
+                        sum[r.week].gap += r.gap;
+                    });
+                    return Object.values(sum).sort((a,b) => parseInt(a.week.replace(/\D/g,'')) - parseInt(b.week.replace(/\D/g,'')));
+                }, [results]);
+
+                return (
+                    <div className="h-[400px] w-full mt-4">
+                        <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={summary} margin={{ top: 20, right: 30, left: 20, bottom: 5 }}>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#D9D9D9" />
+                                <XAxis dataKey="week" stroke="#555" />
+                                <YAxis stroke="#555" />
+                                <RechartsTooltip />
+                                <Legend />
+                                <Bar dataKey="demand" name="需要(h)" fill="#223e76" />
+                                <Bar dataKey="assigned" name="供給可能(h)" fill="#4A7C59" />
+                            </BarChart>
+                        </ResponsiveContainer>
+                    </div>
+                );
+            };
+
+            const FileUploadCard = ({ type, title, icon: Icon }) => {
+                const status = fileStatus[type];
+                return (
+                    <div className="border border-[#D9D9D9] p-4 bg-white flex flex-col gap-3">
+                        <div className="flex items-center gap-2 font-medium text-[#223e76]">
+                            <Icon className="w-5 h-5" />
+                            <h3>{title}</h3>
+                        </div>
+                        <div className="text-sm">
+                            {status.loaded ? (
+                                <div className="flex items-center justify-between bg-[#F8F9FA] p-2 border border-[#D9D9D9]">
+                                    <div className="flex items-center gap-2 text-green-700">
+                                        <CheckCircle2 className="w-4 h-4" />
+                                        <span className="truncate max-w-[180px]" title={status.fileName}>{status.fileName}</span>
+                                    </div>
+                                    <button onClick={() => clearFile(type)} className="text-gray-500 hover:text-red-600"><X className="w-4 h-4"/></button>
+                                </div>
+                            ) : (
+                                <div className="bg-gray-50 p-2 border border-[#D9D9D9] border-dashed text-gray-500 text-center">ファイル未選択</div>
+                            )}
+                        </div>
+                        {!status.loaded ? (
+                            <label className={`flex items-center justify-center gap-2 px-3 py-2 border border-[#D9D9D9] bg-white hover:bg-gray-50 cursor-pointer text-sm font-medium transition-colors ${!xlsxReady ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                                <Upload className="w-4 h-4" />
+                                <span>Excelを選択</span>
+                                <input type="file" accept=".xlsx, .xls" className="hidden" onChange={(e) => handleFileSelect(e, type)} ref={fileInputRefs[type]} disabled={!xlsxReady} />
+                            </label>
+                        ) : (
+                            <div className="text-xs text-gray-500 text-center mt-1">{status.message}</div>
+                        )}
+                    </div>
+                );
+            };
+
+            const getParsedPreviewData = () => {
+                let tsv = '';
+                if (previewTab === 'demand') tsv = demandText;
+                if (previewTab === 'supply') tsv = supplyText;
+                if (previewTab === 'skills') tsv = skillsText;
+                return parseTSV(tsv, previewTab);
+            };
+
+            const parsedData = getParsedPreviewData();
+
+            return (
+                <div className="min-h-screen bg-[#F8F9FA] p-4 font-sans text-gray-800">
+                    <div className="max-w-6xl mx-auto bg-white border border-[#D9D9D9] shadow-sm">
+                        {/* Header */}
+                        <header className="bg-[#223e76] text-white p-4 flex items-center gap-3">
+                            <BarChart3 className="w-6 h-6" />
+                            <h1 className="text-xl font-bold tracking-wider">トップリバー 労働力需給ギャップ分析</h1>
+                            <span className="ml-auto text-sm border border-white/30 px-2 py-1 bg-white/10">Ver 2.1</span>
+                        </header>
+
+                        {/* Navigation */}
+                        <div className="flex border-b border-[#D9D9D9] bg-white">
+                            <button onClick={() => setActiveTab('input')} className={`flex-1 py-3 px-4 text-center font-bold text-sm transition-colors ${activeTab === 'input' ? 'bg-white text-[#223e76] border-b-4 border-[#223e76]' : 'text-gray-500 hover:bg-gray-50'}`}>
+                                1. ファイル読込
+                            </button>
+                            <button onClick={() => setActiveTab('preview')} className={`flex-1 py-3 px-4 text-center font-bold text-sm transition-colors ${activeTab === 'preview' ? 'bg-white text-[#223e76] border-b-4 border-[#223e76]' : 'text-gray-500 hover:bg-gray-50'}`}>
+                                2. データ確認
+                            </button>
+                            <button onClick={() => { if(!calculated) runSimulation(); else setActiveTab('result'); }} className={`flex-1 py-3 px-4 text-center font-bold text-sm transition-colors ${activeTab === 'result' ? 'bg-white text-[#223e76] border-b-4 border-[#223e76]' : 'text-gray-500 hover:bg-gray-50'}`}>
+                                3. 分析結果
+                            </button>
+                        </div>
+
+                        {/* Content Area */}
+                        <div className="p-6">
+                            {/* STEP 1: INPUT */}
+                            {activeTab === 'input' && (
+                                <div className="space-y-6">
+                                    <h2 className="text-lg font-bold text-[#223e76] border-l-4 border-[#223e76] pl-3">対象ファイルの選択</h2>
+                                    <p className="text-sm text-gray-600">各データのExcelファイルを読み込んでください。ファイルを選択すると自動的にデータを解析します。</p>
+                                    
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                        <FileUploadCard type="demand" title="1. 作業計画 (需要)" icon={Calendar} />
+                                        <FileUploadCard type="supply" title="2. 月次シミュ (供給)" icon={Users} />
+                                        <FileUploadCard type="skills" title="3. 人員能力表 (スキル)" icon={Briefcase} />
+                                    </div>
+                                    
+                                    <div className="flex justify-center mt-8">
+                                        <button onClick={() => setActiveTab('preview')} className="bg-[#223e76] hover:bg-[#1a2f59] text-white px-8 py-3 font-bold flex items-center gap-2 transition-colors">
+                                            データの中身を確認する <ChevronRight className="w-5 h-5" />
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* STEP 2: PREVIEW */}
+                            {activeTab === 'preview' && (
+                                <div className="space-y-6">
+                                    <div className="flex items-center justify-between">
+                                        <h2 className="text-lg font-bold text-[#223e76] border-l-4 border-[#223e76] pl-3">読み込みデータの確認</h2>
+                                        <button onClick={runSimulation} className="bg-[#223e76] hover:bg-[#1a2f59] text-white px-6 py-2 font-bold flex items-center gap-2 transition-colors">
+                                            計算実行 <ArrowRight className="w-5 h-5" />
+                                        </button>
+                                    </div>
+                                    
+                                    <p className="text-sm text-gray-600">システムが解析したデータ内容です。列名（ヘッダー）が正しく認識されているか確認してください。</p>
+                                    
+                                    <div className="border border-[#D9D9D9] bg-white">
+                                        <div className="flex border-b border-[#D9D9D9]">
+                                            {[
+                                                {id: 'demand', label: '作業計画', icon: Calendar},
+                                                {id: 'supply', label: '月次シミュ', icon: Users},
+                                                {id: 'skills', label: '人員能力表', icon: Briefcase}
+                                            ].map(tab => (
+                                                <button key={tab.id} onClick={() => setPreviewTab(tab.id)} className={`flex-1 py-2 px-4 flex items-center justify-center gap-2 text-sm font-bold ${previewTab === tab.id ? 'bg-[#223e76] text-white' : 'text-gray-500 hover:bg-gray-50'}`}>
+                                                    <tab.icon className="w-4 h-4" /> {tab.label}
+                                                </button>
+                                            ))}
+                                        </div>
+                                        <div className="p-4 bg-white">
+                                            <DataPreviewTable data={parsedData.data} headers={parsedData.headers} rawLines={parsedData.rawLines} />
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* STEP 3: RESULTS */}
+                            {activeTab === 'result' && (
+                                <div className="space-y-6">
+                                    <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                                        <h2 className="text-lg font-bold text-[#223e76] border-l-4 border-[#223e76] pl-3">分析結果</h2>
+                                        <div className="flex items-center gap-3">
+                                            <button onClick={handleAiAnalysis} disabled={isAiLoading} className="bg-[#4A7C59] hover:bg-[#3b6347] text-white px-4 py-2 font-bold text-sm flex items-center gap-2 transition-colors disabled:opacity-50">
+                                                {isAiLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                                                AI対策提案
+                                            </button>
+                                            <button onClick={handleDownloadCSV} className="bg-white border border-[#D9D9D9] hover:bg-gray-50 text-[#223e76] px-4 py-2 font-bold text-sm flex items-center gap-2 transition-colors">
+                                                <Download className="w-4 h-4" /> CSV出力
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-[#F8F9FA] border border-[#D9D9D9] p-4 text-sm flex flex-col md:flex-row gap-4 justify-between">
+                                        <div><span className="font-bold text-[#223e76]">計算対象期間:</span> 計画 [{simInfo.demandPeriod}] vs 供給 [{simInfo.supplyPeriod}] {simInfo.offsetMsg}</div>
+                                        {diagnosis && (
+                                            <div className="text-gray-600">
+                                                供給人員: <span className="font-bold">{diagnosis.totalWorkers}</span>名 
+                                                (スキル一致: <span className="font-bold">{diagnosis.matchedCount}</span>名 / 不一致: <span className="font-bold text-red-600">{diagnosis.unmatchedCount}</span>名)
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {aiAdvice && (
+                                        <div className="border border-[#4A7C59] bg-[#F4F9F5] p-5">
+                                            <div className="flex items-center gap-2 text-[#4A7C59] font-bold mb-3">
+                                                <Sparkles className="w-5 h-5" /> AIからの提案レポート
+                                            </div>
+                                            <div className="text-sm leading-relaxed whitespace-pre-wrap text-gray-800">{aiAdvice}</div>
+                                        </div>
+                                    )}
+
+                                    <div className="border border-[#D9D9D9] bg-white">
+                                        <div className="flex border-b border-[#D9D9D9] bg-gray-50 p-2 gap-2">
+                                            {['matrix', 'daily', 'weekly'].map(mode => (
+                                                <button key={mode} onClick={() => setResultTab(mode)} className={`px-4 py-2 text-sm font-bold border border-[#D9D9D9] ${resultTab === mode ? 'bg-[#223e76] text-white border-[#223e76]' : 'bg-white text-gray-600 hover:bg-gray-100'}`}>
+                                                    {mode === 'matrix' ? '作業別 不足表' : mode === 'daily' ? '日次詳細リスト' : '週次集計グラフ'}
+                                                </button>
+                                            ))}
+                                        </div>
+                                        <div className="p-4">
+                                            {resultTab === 'matrix' && (
+                                                <>
+                                                    <div className="mb-2 text-sm text-gray-600">※ 数値は「不足時間(h)」を表します。</div>
+                                                    <MatrixView />
+                                                </>
+                                            )}
+                                            {resultTab === 'daily' && <DailyView />}
+                                            {resultTab === 'weekly' && <WeeklyChart />}
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
                 </div>
-              </div>
-            </div>
-          )}
+            );
+        }
 
-          {/* STEP 3: RESULTS */}
-          {activeTab === 'result' && (
-            <div className="space-y-6">
-              
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-                <h2 className="text-lg font-bold text-[#223e76] border-l-4 border-[#223e76] pl-3">分析結果</h2>
-                <div className="flex items-center gap-3">
-                  <button onClick={handleAiAnalysis} disabled={isAiLoading} className="bg-[#4A7C59] hover:bg-[#3b6347] text-white px-4 py-2 font-bold text-sm flex items-center gap-2 transition-colors disabled:opacity-50">
-                    {isAiLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                    AI対策提案
-                  </button>
-                  <button onClick={handleDownloadCSV} className="bg-white border border-[#D9D9D9] hover:bg-gray-50 text-[#223e76] px-4 py-2 font-bold text-sm flex items-center gap-2 transition-colors">
-                    <Download className="w-4 h-4" /> CSV出力
-                  </button>
-                </div>
-              </div>
-
-              <div className="bg-[#F8F9FA] border border-[#D9D9D9] p-4 text-sm flex flex-col md:flex-row gap-4 justify-between">
-                <div><span className="font-bold text-[#223e76]">計算対象期間:</span> 計画 [{simInfo.demandPeriod}] vs 供給 [{simInfo.supplyPeriod}] {simInfo.offsetMsg}</div>
-                {diagnosis && (
-                  <div className="text-gray-600">
-                    供給人員: <span className="font-bold">{diagnosis.totalWorkers}</span>名 
-                    (スキル一致: <span className="font-bold">{diagnosis.matchedCount}</span>名 / 不一致: <span className="font-bold text-red-600">{diagnosis.unmatchedCount}</span>名)
-                  </div>
-                )}
-              </div>
-
-              {aiAdvice && (
-                <div className="border border-[#4A7C59] bg-[#F4F9F5] p-5">
-                  <div className="flex items-center gap-2 text-[#4A7C59] font-bold mb-3">
-                    <Sparkles className="w-5 h-5" /> AIからの提案レポート
-                  </div>
-                  <div className="text-sm leading-relaxed whitespace-pre-wrap text-gray-800">{aiAdvice}</div>
-                </div>
-              )}
-
-              <div className="border border-[#D9D9D9] bg-white">
-                <div className="flex border-b border-[#D9D9D9] bg-gray-50 p-2 gap-2">
-                  {['matrix', 'daily', 'weekly'].map(mode => (
-                    <button
-                      key={mode}
-                      onClick={() => setResultTab(mode)}
-                      className={`px-4 py-2 text-sm font-bold border border-[#D9D9D9] ${resultTab === mode ? 'bg-[#223e76] text-white border-[#223e76]' : 'bg-white text-gray-600 hover:bg-gray-100'}`}
-                    >
-                      {mode === 'matrix' ? '作業別 不足表' : mode === 'daily' ? '日次詳細リスト' : '週次集計グラフ'}
-                    </button>
-                  ))}
-                </div>
-                
-                <div className="p-4">
-                  {resultTab === 'matrix' && (
-                    <>
-                      <div className="mb-2 text-sm text-gray-600">※ 数値は「不足時間(h)」を表します。</div>
-                      <MatrixView />
-                    </>
-                  )}
-                  {resultTab === 'daily' && <DailyView />}
-                  {resultTab === 'weekly' && <WeeklyChart />}
-                </div>
-              </div>
-
-            </div>
-          )}
-
-        </div>
-      </div>
-    </div>
-  );
-}
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
